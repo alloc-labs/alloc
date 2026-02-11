@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alloc"
-version = "0.2.0"
+version = "0.3.0"
 description = "GPU intelligence for ML training — right-size before you launch."
 readme = "README.md"
 license = {text = "Apache-2.0"}
