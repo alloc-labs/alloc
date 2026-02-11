@@ -1,9 +1,18 @@
 """Tests for CLI commands."""
 
+import re
+
 from typer.testing import CliRunner
 from alloc.cli import app
 
 runner = CliRunner()
+
+_ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """Strip ANSI escape codes from text."""
+    return _ansi_re.sub("", text)
 
 
 def test_version():
@@ -17,39 +26,42 @@ def test_help():
     """alloc --help should show available commands."""
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "ghost" in result.output
-    assert "run" in result.output
-    assert "scan" in result.output
-    assert "version" in result.output
+    out = _plain(result.output)
+    assert "ghost" in out
+    assert "run" in out
+    assert "scan" in out
+    assert "version" in out
 
 
 def test_ghost_help():
     """alloc ghost --help should show options."""
     result = runner.invoke(app, ["ghost", "--help"])
     assert result.exit_code == 0
-    assert "script" in result.output.lower() or "SCRIPT" in result.output
+    out = _plain(result.output)
+    assert "script" in out.lower() or "SCRIPT" in out
 
 
 def test_scan_help():
     """alloc scan --help should show options."""
     result = runner.invoke(app, ["scan", "--help"])
     assert result.exit_code == 0
-    assert "--model" in result.output
-    assert "--gpu" in result.output
+    out = _plain(result.output)
+    assert "--model" in out
+    assert "--gpu" in out
 
 
 def test_run_help_shows_full():
     """alloc run --help should show --full option."""
     result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--full" in result.output
+    assert "--full" in _plain(result.output)
 
 
 def test_run_help_hides_probe_steps():
     """alloc run --help should NOT show deprecated --probe-steps."""
     result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--probe-steps" not in result.output
+    assert "--probe-steps" not in _plain(result.output)
 
 
 # --- --json flag tests ---
@@ -58,21 +70,21 @@ def test_ghost_json_flag_in_help():
     """alloc ghost --help should show --json option."""
     result = runner.invoke(app, ["ghost", "--help"])
     assert result.exit_code == 0
-    assert "--json" in result.output
+    assert "--json" in _plain(result.output)
 
 
 def test_run_json_flag_in_help():
     """alloc run --help should show --json option."""
     result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--json" in result.output
+    assert "--json" in _plain(result.output)
 
 
 def test_scan_json_flag_in_help():
     """alloc scan --help should show --json option."""
     result = runner.invoke(app, ["scan", "--help"])
     assert result.exit_code == 0
-    assert "--json" in result.output
+    assert "--json" in _plain(result.output)
 
 
 def test_ghost_json_output():
@@ -104,14 +116,14 @@ def test_ghost_verbose_flag_in_help():
     """alloc ghost --help should show --verbose option."""
     result = runner.invoke(app, ["ghost", "--help"])
     assert result.exit_code == 0
-    assert "--verbose" in result.output
+    assert "--verbose" in _plain(result.output)
 
 
 def test_run_verbose_flag_in_help():
     """alloc run --help should show --verbose option."""
     result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
-    assert "--verbose" in result.output
+    assert "--verbose" in _plain(result.output)
 
 
 def test_ghost_verbose_output():
