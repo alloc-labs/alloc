@@ -6,5 +6,6 @@ __version__ = "0.3.0"
 
 from alloc.ghost import ghost, GhostReport
 from alloc.callbacks import AllocCallback as HuggingFaceCallback
+from alloc.callbacks import AllocLightningCallback as LightningCallback
 
-__all__ = ["ghost", "GhostReport", "HuggingFaceCallback", "__version__"]
+__all__ = ["ghost", "GhostReport", "HuggingFaceCallback", "LightningCallback", "__version__"]

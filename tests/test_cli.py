@@ -1,9 +1,11 @@
 """Tests for CLI commands."""
 
+import json as json_mod
+import os
 import re
 
 from typer.testing import CliRunner
-from alloc.cli import app
+from alloc.cli import app, _read_callback_data
 
 runner = CliRunner()
 
@@ -154,3 +156,52 @@ def test_ghost_timeout_flag_in_help():
     result = runner.invoke(app, ["ghost", "--help"])
     assert result.exit_code == 0
     assert "--timeout" in _plain(result.output)
+
+
+# --- Callback sidecar reading tests ---
+
+def test_read_callback_data_new_format(tmp_path, monkeypatch):
+    """_read_callback_data reads .alloc_callback.json with timing fields."""
+    monkeypatch.chdir(tmp_path)
+    data = {
+        "framework": "huggingface",
+        "step_count": 200,
+        "step_time_ms_p50": 148.5,
+        "step_time_ms_p90": 152.1,
+        "samples_per_sec": 42.3,
+        "dataloader_wait_pct": 5.0,
+    }
+    (tmp_path / ".alloc_callback.json").write_text(json_mod.dumps(data))
+    result = _read_callback_data()
+    assert result is not None
+    assert result["step_count"] == 200
+    assert result["step_time_ms_p50"] == 148.5
+    assert result["samples_per_sec"] == 42.3
+
+
+def test_read_callback_data_legacy_fallback(tmp_path, monkeypatch):
+    """_read_callback_data falls back to .alloc_steps.json (legacy format)."""
+    monkeypatch.chdir(tmp_path)
+    data = {"framework": "huggingface", "step_count": 42}
+    (tmp_path / ".alloc_steps.json").write_text(json_mod.dumps(data))
+    result = _read_callback_data()
+    assert result is not None
+    assert result["step_count"] == 42
+    assert result.get("step_time_ms_p50") is None
+
+
+def test_read_callback_data_prefers_new_format(tmp_path, monkeypatch):
+    """When both sidecar files exist, .alloc_callback.json is preferred."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".alloc_steps.json").write_text(json_mod.dumps({"step_count": 10}))
+    (tmp_path / ".alloc_callback.json").write_text(
+        json_mod.dumps({"step_count": 99, "step_time_ms_p50": 100.0})
+    )
+    result = _read_callback_data()
+    assert result["step_count"] == 99
+
+
+def test_read_callback_data_returns_none(tmp_path, monkeypatch):
+    """No sidecar files → None."""
+    monkeypatch.chdir(tmp_path)
+    assert _read_callback_data() is None

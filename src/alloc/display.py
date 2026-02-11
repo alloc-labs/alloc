@@ -92,8 +92,8 @@ def print_probe_result(result: ProbeResult) -> None:
 # --- Verdict display for calibrate-and-exit mode ---
 
 
-def print_verdict(result, artifact_path="", step_count=None):
-    # type: (ProbeResult, str, Optional[int]) -> None
+def print_verdict(result, artifact_path="", step_count=None, callback_data=None):
+    # type: (ProbeResult, str, Optional[int], Optional[dict]) -> None
     """Print a verdict summary panel after calibration."""
     vram_util_pct = result.vram_utilization_pct
     bottleneck = _classify_bottleneck_local(
@@ -105,6 +105,7 @@ def print_verdict(result, artifact_path="", step_count=None):
         len(result.samples),
         result.duration_seconds,
         step_count,
+        callback_data=callback_data,
     )
     recommendation = _qualitative_recommendation(bottleneck, vram_util_pct, result.avg_gpu_util)
     duration_label = _stop_reason_label(result.stop_reason, result.calibration_duration_s)
@@ -153,6 +154,19 @@ def print_verdict(result, artifact_path="", step_count=None):
         lines.append(f"  Duration        {result.duration_seconds:.1f}s ({duration_label})")
         lines.append(f"  Samples         {len(result.samples)}")
         lines.append(f"  Process         {proc_status}")
+
+        # Timing from framework callbacks
+        if callback_data:
+            p50 = callback_data.get("step_time_ms_p50")
+            p90 = callback_data.get("step_time_ms_p90")
+            sps = callback_data.get("samples_per_sec")
+            dl_wait = callback_data.get("dataloader_wait_pct")
+            if p50 is not None and p90 is not None:
+                lines.append(f"  Step time       {p50:.1f} ms (p50) / {p90:.1f} ms (p90)")
+            if sps is not None:
+                lines.append(f"  Throughput      {sps:.1f} samples/sec")
+            if dl_wait is not None and dl_wait > 15:
+                lines.append(f"  Dataloader      ~{dl_wait:.0f}% wait (consider more workers)")
 
         if recommendation:
             lines.append("")
@@ -237,9 +251,14 @@ def _classify_bottleneck_local(peak_vram_mb, gpu_total_vram_mb, avg_gpu_util):
     return "balanced"
 
 
-def _compute_confidence_local(sample_count, duration_s, step_count=None):
-    # type: (int, float, Optional[int]) -> float
-    """Estimate analysis confidence. Matches analyzer.py:253-278 formula, capped at 0.6."""
+def _compute_confidence_local(sample_count, duration_s, step_count=None, callback_data=None):
+    # type: (int, float, Optional[int], Optional[dict]) -> float
+    """Estimate analysis confidence. Matches analyzer.py confidence formula.
+
+    Cap depends on signal level:
+      NVML_ONLY (no callback timing) → max 0.6
+      FRAMEWORK_TIMING (callback with step timing) → max 0.85
+    """
     score = 0.3  # Baseline: we have probe data
 
     if sample_count >= 100:
@@ -257,8 +276,13 @@ def _compute_confidence_local(sample_count, duration_s, step_count=None):
     if step_count and step_count > 0:
         score += 0.2
 
-    # NVML_ONLY signal level — CLI never has framework timing
-    return min(score, 0.6)
+    # Determine signal level cap
+    has_timing = (
+        callback_data is not None
+        and callback_data.get("step_time_ms_p50") is not None
+    )
+    cap = 0.85 if has_timing else 0.6
+    return min(score, cap)
 
 
 def _qualitative_recommendation(bottleneck, vram_utilization_pct, avg_gpu_util):
@@ -301,8 +325,8 @@ def _stop_reason_label(stop_reason, calibration_duration_s=None):
     return "unknown"
 
 
-def build_verdict_dict(result, artifact_path="", step_count=None):
-    # type: (ProbeResult, str, Optional[int]) -> dict
+def build_verdict_dict(result, artifact_path="", step_count=None, callback_data=None):
+    # type: (ProbeResult, str, Optional[int], Optional[dict]) -> dict
     """Build a verdict dict with the same data as print_verdict, for JSON output."""
     vram_util_pct = result.vram_utilization_pct
     bottleneck = _classify_bottleneck_local(
@@ -314,6 +338,7 @@ def build_verdict_dict(result, artifact_path="", step_count=None):
         len(result.samples),
         result.duration_seconds,
         step_count,
+        callback_data=callback_data,
     )
     recommendation = _qualitative_recommendation(bottleneck, vram_util_pct, result.avg_gpu_util)
     duration_label = _stop_reason_label(result.stop_reason, result.calibration_duration_s)
@@ -342,6 +367,12 @@ def build_verdict_dict(result, artifact_path="", step_count=None):
         "recommendation": recommendation,
         "artifact_path": artifact_path or None,
     }
+    # Include timing fields from callback data
+    if callback_data:
+        for key in ("step_time_ms_p50", "step_time_ms_p90", "samples_per_sec", "dataloader_wait_pct"):
+            val = callback_data.get(key)
+            if val is not None:
+                d[key] = val
     return d
 
 
@@ -433,7 +464,7 @@ def print_verbose_run(result, step_count=None):
         else:
             reason_lines.append(f"    Step count          +0.00  (no callback)")
 
-        reason_lines.append(f"    Cap (NVML_ONLY)     max 0.60")
+        reason_lines.append(f"    Signal cap          max 0.60 (NVML_ONLY)")
 
         if recommendation:
             reason_lines.append("")

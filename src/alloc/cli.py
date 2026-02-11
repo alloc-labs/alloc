@@ -177,8 +177,9 @@ def run(
         if probe_steps and result.steps_profiled:
             console.print(f"[dim]Profiled {result.steps_profiled} samples in {result.duration_seconds:.1f}s[/dim]")
 
-    # Read step count from sidecar (written by framework callbacks)
-    step_count = _read_step_count()
+    # Read callback data from sidecar (written by framework callbacks)
+    callback_data = _read_callback_data()
+    step_count = callback_data.get("step_count") if callback_data else None
 
     # Discover environment context (git, container, Ray)
     from alloc.context import discover_context
@@ -202,6 +203,12 @@ def run(
             "calibration_duration_s": result.calibration_duration_s,
             "step_count": step_count,
         }
+        # Merge timing fields from callback sidecar
+        if callback_data:
+            for key in ("step_time_ms_p50", "step_time_ms_p90", "samples_per_sec", "dataloader_wait_pct"):
+                val = callback_data.get(key)
+                if val is not None:
+                    probe_dict[key] = val
         hw_context = {
             "gpu_name": result.gpu_name,
             "gpu_total_vram_mb": result.gpu_total_vram_mb,
@@ -219,14 +226,14 @@ def run(
 
     if json_output:
         from alloc.display import build_verdict_dict
-        data = build_verdict_dict(result, artifact_path=artifact_path, step_count=step_count)
+        data = build_verdict_dict(result, artifact_path=artifact_path, step_count=step_count, callback_data=callback_data)
         if result.error:
             data["error"] = result.error
         _print_json(data)
     else:
         # Display verdict for all modes when we have GPU data
         if result.peak_vram_mb > 0:
-            print_verdict(result, artifact_path=artifact_path, step_count=step_count)
+            print_verdict(result, artifact_path=artifact_path, step_count=step_count, callback_data=callback_data)
             if verbose:
                 from alloc.display import print_verbose_run
                 print_verbose_run(result, step_count=step_count)
@@ -660,16 +667,27 @@ def _try_upload(artifact_path: str) -> None:
         console.print(f"[dim]You can retry later: alloc upload {artifact_path}[/dim]")
 
 
-def _read_step_count():
-    # type: () -> Optional[int]
-    """Read step count from sidecar file written by framework callbacks."""
+def _read_callback_data():
+    # type: () -> Optional[dict]
+    """Read callback data from sidecar file written by framework callbacks.
+
+    Reads .alloc_callback.json first (new format with timing),
+    falls back to .alloc_steps.json (legacy step-count-only format).
+    """
     try:
+        # New format: full timing data
+        callback_path = os.path.join(os.getcwd(), ".alloc_callback.json")
+        if os.path.isfile(callback_path):
+            with open(callback_path, "r") as f:
+                return json_mod.load(f)
+    except Exception:
+        pass
+    try:
+        # Legacy format: step count only
         steps_path = os.path.join(os.getcwd(), ".alloc_steps.json")
         if os.path.isfile(steps_path):
-            import json as json_mod
             with open(steps_path, "r") as f:
-                data = json_mod.load(f)
-            return data.get("step_count")
+                return json_mod.load(f)
     except Exception:
         pass
     return None
