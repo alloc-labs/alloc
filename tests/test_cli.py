@@ -98,10 +98,10 @@ def test_ghost_json_output():
     assert "error" in data
 
 
-def test_ghost_json_output_7b():
-    """alloc ghost --json should output valid JSON for a known model size."""
+def test_ghost_json_output_param_count():
+    """alloc ghost --json with --param-count-b should output valid JSON."""
     import json
-    result = runner.invoke(app, ["ghost", "train_7b.py", "--json"])
+    result = runner.invoke(app, ["ghost", "train.py", "--json", "--param-count-b", "7.0"])
     assert result.exit_code == 0
     data = json.loads(result.output.strip())
     assert "total_gb" in data
@@ -128,7 +128,7 @@ def test_run_verbose_flag_in_help():
 
 def test_ghost_verbose_output():
     """alloc ghost --verbose should show VRAM formula breakdown."""
-    result = runner.invoke(app, ["ghost", "train_7b.py", "--verbose"])
+    result = runner.invoke(app, ["ghost", "train.py", "--verbose", "--param-count-b", "7.0"])
     assert result.exit_code == 0
     assert "VRAM Formula Breakdown" in result.output or "bytes/param" in result.output
 
@@ -136,7 +136,21 @@ def test_ghost_verbose_output():
 def test_ghost_verbose_and_json_mutual():
     """--json should suppress verbose output (JSON mode wins)."""
     import json
-    result = runner.invoke(app, ["ghost", "train_7b.py", "--json", "--verbose"])
+    result = runner.invoke(app, ["ghost", "train.py", "--json", "--verbose", "--param-count-b", "7.0"])
     assert result.exit_code == 0
     data = json.loads(result.output.strip())
     assert "total_gb" in data
+
+
+def test_ghost_param_count_flag_in_help():
+    """alloc ghost --help should show --param-count-b option."""
+    result = runner.invoke(app, ["ghost", "--help"])
+    assert result.exit_code == 0
+    assert "--param-count-b" in _plain(result.output)
+
+
+def test_ghost_timeout_flag_in_help():
+    """alloc ghost --help should show --timeout option."""
+    result = runner.invoke(app, ["ghost", "--help"])
+    assert result.exit_code == 0
+    assert "--timeout" in _plain(result.output)

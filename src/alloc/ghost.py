@@ -40,6 +40,7 @@ class GhostReport:
     activations_gb: float
     buffer_gb: float
     total_gb: float
+    extraction_method: Optional[str] = None  # "execution", "ast", "manual"
 
     def to_dict(self) -> dict:
         return asdict(self)

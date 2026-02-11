@@ -41,37 +41,55 @@ def ghost(
     hidden_dim: int = typer.Option(4096, help="Hidden dimension"),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed VRAM formula breakdown"),
+    param_count_b: Optional[float] = typer.Option(None, "--param-count-b", "-p", help="Param count in billions (skip script analysis)"),
+    timeout: int = typer.Option(60, "--timeout", help="Max seconds for model extraction"),
+    no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
 ):
     """Ghost scan — static VRAM analysis without executing the model."""
     from alloc.ghost import ghost as ghost_fn
     from alloc.display import print_ghost_report
+    from alloc.model_extractor import extract_model_info
 
-    # Try to extract param count from the script by importing it
-    param_count = _extract_param_count(script)
+    # Load GPU context from .alloc.yaml
+    gpu_context = _load_gpu_context(no_config)
 
-    if param_count is None:
+    info = extract_model_info(script, timeout=timeout, param_count_b=param_count_b)
+
+    if info is None:
         if json_output:
             _print_json({"error": f"Could not extract model from {script}"})
         else:
             console.print(f"[yellow]Could not extract model from {script}.[/yellow]")
-            console.print("[dim]Tip: Use 'alloc scan --param-count-b 7.0' for direct param count input.[/dim]")
+            console.print("[dim]Supported: PyTorch nn.Module, HuggingFace AutoModel, Lightning modules.[/dim]")
+            console.print(f"[dim]Tip: alloc ghost {script} --param-count-b 7.0[/dim]")
         raise typer.Exit(1)
 
+    # Use dtype from execution if available, otherwise CLI flag
+    resolved_dtype = info.dtype if info.method == "execution" else dtype
+
     report = ghost_fn(
-        param_count=param_count,
-        dtype=dtype,
+        param_count=info.param_count,
+        dtype=resolved_dtype,
         batch_size=batch_size,
         seq_length=seq_length,
         hidden_dim=hidden_dim,
     )
+    report.extraction_method = info.method
 
     if json_output:
-        _print_json(report.to_dict())
+        data = report.to_dict()
+        if gpu_context:
+            data["gpu_context"] = gpu_context
+        _print_json(data)
     else:
         print_ghost_report(report)
+        if gpu_context and not verbose:
+            _print_gpu_context_summary(gpu_context)
         if verbose:
             from alloc.display import print_verbose_ghost
             print_verbose_ghost(report)
+            if gpu_context:
+                _print_gpu_context_detail(gpu_context)
 
 
 @app.command()
@@ -86,11 +104,15 @@ def run(
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show hardware context, sample dump, recommendation reasoning"),
     probe_steps: Optional[int] = typer.Option(None, "--probe-steps", hidden=True, help="[Deprecated] Use default calibration instead"),
+    no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
 ):
     """Run a training command with GPU monitoring."""
     from alloc.probe import probe_command
     from alloc.display import print_probe_result, print_verdict
     from alloc.artifact_writer import write_report
+
+    # Load GPU context from .alloc.yaml
+    gpu_context = _load_gpu_context(no_config)
 
     if not command:
         console.print("[red]No command provided.[/red]")
@@ -374,6 +396,125 @@ def upload(
 
 
 @app.command()
+def init(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive: full catalog, 50/50 priority, no budget"),
+):
+    """Create .alloc.yaml with GPU fleet, explore, budget, and priority."""
+    from alloc.yaml_config import AllocConfig, FleetEntry, write_alloc_config, validate_config
+    from alloc.catalog import list_gpus
+
+    if os.path.isfile(".alloc.yaml"):
+        if not yes:
+            overwrite = typer.confirm(".alloc.yaml already exists. Overwrite?", default=False)
+            if not overwrite:
+                raise typer.Exit(0)
+
+    gpus = list_gpus()
+
+    if yes:
+        # Non-interactive: all GPUs as fleet, balanced priority
+        config = AllocConfig(
+            fleet=[FleetEntry(gpu=g["id"]) for g in gpus],
+            priority_cost=50,
+        )
+    else:
+        # Interactive wizard
+        console.print(f"\n[green]alloc init[/green] — GPU fleet configuration\n")
+
+        # 1. Select fleet GPUs
+        console.print("[bold]Available GPUs:[/bold]")
+        for i, g in enumerate(gpus):
+            price_str = ""
+            aws = g["pricing"].get("aws")
+            if aws:
+                price_str = f" ${aws:.2f}/hr"
+            console.print(f"  [dim]{i + 1:>2}.[/dim] {g['display_name']:>20}  {g['vram_gb']:.0f} GB{price_str}")
+
+        console.print()
+        fleet_input = typer.prompt(
+            "Fleet GPUs (comma-separated numbers, or 'all')",
+            default="all",
+        )
+
+        if fleet_input.strip().lower() == "all":
+            fleet_entries = [FleetEntry(gpu=g["id"]) for g in gpus]
+        else:
+            fleet_entries = []
+            for part in fleet_input.split(","):
+                part = part.strip()
+                if part.isdigit():
+                    idx = int(part) - 1
+                    if 0 <= idx < len(gpus):
+                        fleet_entries.append(FleetEntry(gpu=gpus[idx]["id"]))
+
+        if not fleet_entries:
+            console.print("[yellow]No GPUs selected, using full catalog.[/yellow]")
+            fleet_entries = [FleetEntry(gpu=g["id"]) for g in gpus]
+
+        # 2. Explore GPUs (from remaining catalog)
+        fleet_ids = {e.gpu for e in fleet_entries}
+        remaining = [g for g in gpus if g["id"] not in fleet_ids]
+        explore_entries = []  # type: list
+        if remaining:
+            add_explore = typer.confirm("Add explore GPUs (evaluate GPUs you don't have)?", default=False)
+            if add_explore:
+                console.print("\n[bold]GPUs not in fleet:[/bold]")
+                for i, g in enumerate(remaining):
+                    console.print(f"  [dim]{i + 1:>2}.[/dim] {g['display_name']:>20}  {g['vram_gb']:.0f} GB")
+                explore_input = typer.prompt("Explore GPUs (comma-separated numbers)", default="")
+                for part in explore_input.split(","):
+                    part = part.strip()
+                    if part.isdigit():
+                        idx = int(part) - 1
+                        if 0 <= idx < len(remaining):
+                            explore_entries.append(FleetEntry(gpu=remaining[idx]["id"], explore=True))
+
+        # 3. Priority
+        console.print("\n[bold]Priority[/bold] — how to rank GPU recommendations:")
+        console.print("  1. Minimize Cost (cost=80, latency=20)")
+        console.print("  2. Balanced (cost=50, latency=50)")
+        console.print("  3. Minimize Time (cost=20, latency=80)")
+        priority_choice = typer.prompt("Choose", default="2")
+        priority_map = {"1": 80, "2": 50, "3": 20}
+        priority_cost = priority_map.get(priority_choice.strip(), 50)
+
+        # 4. Budget
+        budget_monthly = None  # type: Optional[float]
+        set_budget = typer.confirm("\nSet a monthly GPU budget?", default=False)
+        if set_budget:
+            budget_str = typer.prompt("Monthly budget (USD)", default="0")
+            try:
+                budget_monthly = float(budget_str)
+                if budget_monthly <= 0:
+                    budget_monthly = None
+            except ValueError:
+                budget_monthly = None
+
+        config = AllocConfig(
+            fleet=fleet_entries,
+            explore=explore_entries,
+            priority_cost=priority_cost,
+            budget_monthly=budget_monthly,
+        )
+
+    errors = validate_config(config)
+    if errors:
+        for err in errors:
+            console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1)
+
+    path = write_alloc_config(config)
+    fleet_count = len(config.fleet)
+    explore_count = len(config.explore)
+    console.print(f"\n[green]Created {path}[/green]")
+    console.print(f"  Fleet: {fleet_count} GPUs, Explore: {explore_count} GPUs")
+    console.print(f"  Priority: cost={config.priority_cost}, latency={config.priority_latency}")
+    if config.budget_monthly:
+        console.print(f"  Budget: ${config.budget_monthly:.0f}/mo")
+    console.print()
+
+
+@app.command()
 def version():
     """Show alloc version."""
     console.print(f"alloc v{__version__}")
@@ -583,27 +724,6 @@ def _print_scan_result(result: dict, gpu: str, strategy: str) -> None:
     console.print()
 
 
-def _extract_param_count(script: str) -> Optional[int]:
-    """Try to extract param count from a Python script. Returns None if can't."""
-    # For now, don't execute the script — just check common model names in filename
-    import os
-    basename = os.path.basename(script).lower()
-
-    # Common model size patterns
-    patterns = {
-        "70b": int(70e9), "65b": int(65e9), "40b": int(40e9),
-        "33b": int(33e9), "30b": int(30e9), "13b": int(13e9),
-        "8b": int(8e9), "7b": int(7e9), "3b": int(3e9),
-        "1.5b": int(1.5e9), "1b": int(1e9),
-        "350m": int(350e6), "125m": int(125e6),
-    }
-    for pattern, count in patterns.items():
-        if pattern in basename:
-            return count
-
-    return None
-
-
 # Well-known model names → param count in billions
 _MODEL_PARAMS = {
     "llama-3-70b": 70.0,
@@ -646,3 +766,68 @@ def _model_to_params(model: str) -> Optional[float]:
     """Look up model param count by name."""
     normalized = model.lower().strip()
     return _MODEL_PARAMS.get(normalized)
+
+
+# ---------------------------------------------------------------------------
+# GPU context helpers
+# ---------------------------------------------------------------------------
+
+def _load_gpu_context(no_config: bool) -> Optional[dict]:
+    """Load GPU context from .alloc.yaml. Returns None if disabled or not found."""
+    if no_config:
+        return None
+    try:
+        from alloc.yaml_config import load_alloc_config
+        config = load_alloc_config()
+        if config is None:
+            return None
+        return {
+            "fleet": config.fleet_gpu_ids,
+            "explore": config.explore_gpu_ids,
+            "priority_cost": config.priority_cost,
+            "priority_latency": config.priority_latency,
+            "budget_monthly": config.budget_monthly,
+            "budget_hourly": config.budget_hourly,
+            "rate_overrides": config.rate_overrides,
+        }
+    except Exception:
+        return None
+
+
+def _print_gpu_context_summary(ctx: dict) -> None:
+    """Print a one-line GPU context summary."""
+    fleet_count = len(ctx.get("fleet", []))
+    explore_count = len(ctx.get("explore", []))
+    parts = []
+    if fleet_count:
+        parts.append(f"{fleet_count} fleet")
+    if explore_count:
+        parts.append(f"{explore_count} explore")
+    priority = f"cost={ctx.get('priority_cost', 50)}"
+    parts.append(priority)
+    budget = ctx.get("budget_monthly")
+    if budget:
+        parts.append(f"${budget:.0f}/mo")
+    console.print(f"  [dim]GPU context: {', '.join(parts)} (from .alloc.yaml)[/dim]")
+    console.print()
+
+
+def _print_gpu_context_detail(ctx: dict) -> None:
+    """Print detailed GPU context for verbose mode."""
+    from rich.panel import Panel
+    lines = []
+    fleet = ctx.get("fleet", [])
+    if fleet:
+        lines.append(f"  Fleet GPUs      {', '.join(fleet)}")
+    explore = ctx.get("explore", [])
+    if explore:
+        lines.append(f"  Explore GPUs    {', '.join(explore)}")
+    lines.append(f"  Priority        cost={ctx.get('priority_cost', 50)}, latency={ctx.get('priority_latency', 50)}")
+    budget_m = ctx.get("budget_monthly")
+    if budget_m:
+        lines.append(f"  Budget          ${budget_m:.0f}/mo")
+    overrides = ctx.get("rate_overrides", {})
+    if overrides:
+        for gpu, rate in overrides.items():
+            lines.append(f"  Rate override   {gpu}: ${rate:.2f}/hr")
+    console.print(Panel("\n".join(lines), title="GPU Context (.alloc.yaml)", border_style="cyan", padding=(1, 0)))

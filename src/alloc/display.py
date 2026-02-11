@@ -31,9 +31,10 @@ def print_ghost_report(report: GhostReport) -> None:
         table.add_row("[bold]Total VRAM[/bold]", f"[bold green]{report.total_gb:.2f} GB[/bold green]")
 
         header = f"Ghost Scan — {report.param_count_b:.1f}B params ({report.dtype})"
+        confidence_label = _ghost_confidence_label(getattr(report, "extraction_method", None))
         console.print()
         console.print(Panel(table, title=header, border_style="green", padding=(1, 2)))
-        console.print(f"  [dim]Confidence: 80% (static estimate)[/dim]")
+        console.print(f"  [dim]Confidence: {confidence_label}[/dim]")
         console.print()
     except ImportError:
         # Fallback without rich
@@ -42,6 +43,7 @@ def print_ghost_report(report: GhostReport) -> None:
 
 def _print_ghost_plain(report: GhostReport) -> None:
     """Plain-text fallback when Rich is not available."""
+    confidence_label = _ghost_confidence_label(getattr(report, "extraction_method", None))
     print(f"\n  Ghost Scan — {report.param_count_b:.1f}B params ({report.dtype})")
     print(f"  {'─' * 40}")
     print(f"  Model weights:      {report.weights_gb:>8.2f} GB")
@@ -51,7 +53,7 @@ def _print_ghost_plain(report: GhostReport) -> None:
     print(f"  Buffer (10%):       {report.buffer_gb:>8.2f} GB")
     print(f"  {'─' * 40}")
     print(f"  Total VRAM:         {report.total_gb:>8.2f} GB")
-    print(f"\n  Confidence: 80% (static estimate)\n")
+    print(f"\n  Confidence: {confidence_label}\n")
 
 
 def print_probe_result(result: ProbeResult) -> None:
@@ -491,11 +493,22 @@ def print_verbose_ghost(report):
         lines.append(f"  Buffer          10% x ({subtotal:.2f} GB) = {report.buffer_gb:.2f} GB")
         lines.append("")
         lines.append(f"  Total           {report.total_gb:.2f} GB")
-        lines.append(f"  Confidence      80% (static estimate, no runtime data)")
+        confidence_label = _ghost_confidence_label(getattr(report, "extraction_method", None))
+        lines.append(f"  Confidence      {confidence_label}")
 
         console.print(Panel("\n".join(lines), title="VRAM Formula Breakdown", border_style="cyan", padding=(1, 0)))
     except ImportError:
         pass
+
+
+def _ghost_confidence_label(extraction_method):
+    # type: (Optional[str]) -> str
+    """Return confidence label based on how model params were extracted."""
+    if extraction_method == "execution":
+        return "85% (exact param count)"
+    if extraction_method == "ast":
+        return "75% (inferred from model name)"
+    return "80% (static estimate)"
 
 
 def _bottleneck_color(bottleneck):
