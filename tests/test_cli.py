@@ -179,15 +179,13 @@ def test_read_callback_data_new_format(tmp_path, monkeypatch):
     assert result["samples_per_sec"] == 42.3
 
 
-def test_read_callback_data_legacy_fallback(tmp_path, monkeypatch):
-    """_read_callback_data falls back to .alloc_steps.json (legacy format)."""
+def test_read_callback_data_legacy_file_ignored(tmp_path, monkeypatch):
+    """Legacy .alloc_steps.json is ignored."""
     monkeypatch.chdir(tmp_path)
     data = {"framework": "huggingface", "step_count": 42}
     (tmp_path / ".alloc_steps.json").write_text(json_mod.dumps(data))
     result = _read_callback_data()
-    assert result is not None
-    assert result["step_count"] == 42
-    assert result.get("step_time_ms_p50") is None
+    assert result is None
 
 
 def test_read_callback_data_prefers_new_format(tmp_path, monkeypatch):

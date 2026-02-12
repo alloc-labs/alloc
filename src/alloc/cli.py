@@ -103,7 +103,6 @@ def run(
     full: bool = typer.Option(False, "--full", help="Monitor full training run instead of calibrating"),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show hardware context, sample dump, recommendation reasoning"),
-    probe_steps: Optional[int] = typer.Option(None, "--probe-steps", hidden=True, help="[Deprecated] Use default calibration instead"),
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
 ):
     """Run a training command with GPU monitoring."""
@@ -127,15 +126,8 @@ def run(
     if alloc_policy:
         full = True
 
-    # Deprecation warnings
-    if probe_steps is not None and full:
-        console.print("[yellow]--probe-steps ignored when --full is set.[/yellow]")
-        probe_steps = None
-    elif probe_steps is not None:
-        console.print("[yellow]--probe-steps is deprecated. Default calibration mode auto-stops when metrics stabilize.[/yellow]")
-
     # Determine mode
-    calibrate = not full and probe_steps is None
+    calibrate = not full
 
     # Effective timeout: unlimited for --full unless user explicitly set it
     effective_timeout = timeout
@@ -148,22 +140,19 @@ def run(
     elif full:
         mode_label = "Full monitoring"
     else:
-        mode_label = "Short-run probe (deprecated)"
+        mode_label = "Calibrate"
 
     if not json_output:
         console.print(f"[green]alloc[/green] [dim]v{__version__}[/dim] — {mode_label}")
         console.print(f"[dim]Command: {' '.join(command)}[/dim]")
         if calibrate:
             console.print(f"[dim]Auto-stop when metrics stabilize (timeout: {timeout}s)[/dim]")
-        elif probe_steps:
-            console.print(f"[dim]Profiling for ~{probe_steps} samples (auto-stop when stable)[/dim]")
         console.print()
 
     result = probe_command(
         command,
         timeout_seconds=effective_timeout,
         gpu_index=gpu,
-        probe_steps=probe_steps,
         calibrate=calibrate,
     )
 
@@ -174,9 +163,6 @@ def run(
         elif result.error:
             console.print(f"[red]Error: {result.error}[/red]")
 
-        if probe_steps and result.steps_profiled:
-            console.print(f"[dim]Profiled {result.steps_profiled} samples in {result.duration_seconds:.1f}s[/dim]")
-
     # Read callback data from sidecar (written by framework callbacks)
     callback_data = _read_callback_data()
     step_count = callback_data.get("step_count") if callback_data else None
@@ -184,6 +170,9 @@ def run(
     # Discover environment context (git, container, Ray)
     from alloc.context import discover_context
     env_context = discover_context()
+    topology = _infer_parallel_topology_from_env(num_gpus_detected=result.num_gpus_detected)
+    objective = os.environ.get("ALLOC_OBJECTIVE", "").strip().lower() or _objective_from_context(gpu_context)
+    max_budget_hourly = _max_budget_hourly_from_context(gpu_context)
 
     # Build artifact dict with new fields
     artifact_path = ""
@@ -202,6 +191,14 @@ def run(
             "gpu_total_vram_mb": result.gpu_total_vram_mb,
             "calibration_duration_s": result.calibration_duration_s,
             "step_count": step_count,
+            "num_nodes": topology.get("num_nodes"),
+            "gpus_per_node": topology.get("gpus_per_node"),
+            "tp_degree": topology.get("tp_degree"),
+            "pp_degree": topology.get("pp_degree"),
+            "dp_degree": topology.get("dp_degree"),
+            "interconnect_type": topology.get("interconnect_type"),
+            "objective": objective,
+            "max_budget_hourly": max_budget_hourly,
         }
         # Merge timing fields from callback sidecar
         if callback_data:
@@ -257,8 +254,32 @@ def scan(
     model: str = typer.Option(..., "--model", "-m", help="Model name (e.g. llama-3-70b)"),
     gpu: str = typer.Option("A100-80GB", "--gpu", "-g", help="Target GPU type"),
     dtype: str = typer.Option("fp16", help="Data type: fp16, bf16, fp32"),
-    strategy: str = typer.Option("ddp", help="Strategy: ddp, fsdp, deepspeed"),
-    num_gpus: int = typer.Option(4, help="Number of GPUs"),
+    strategy: str = typer.Option(
+        "ddp",
+        help=(
+            "Strategy: ddp, fsdp, tp, pp, tp+dp, pp+dp, tp+pp+dp, tp+pp+fsdp"
+        ),
+    ),
+    num_gpus: int = typer.Option(1, help="Number of GPUs"),
+    objective: str = typer.Option(
+        "best_value",
+        help="Objective: cheapest, fastest, fastest_within_budget, best_value",
+    ),
+    max_budget_hourly: Optional[float] = typer.Option(
+        None,
+        "--max-budget-hourly",
+        help="Optional max $/hr budget for this planning run",
+    ),
+    num_nodes: Optional[int] = typer.Option(None, "--num-nodes", help="Cluster node count"),
+    gpus_per_node: Optional[int] = typer.Option(None, "--gpus-per-node", help="GPUs per node"),
+    tp_degree: Optional[int] = typer.Option(None, "--tp-degree", help="Tensor parallel degree"),
+    pp_degree: Optional[int] = typer.Option(None, "--pp-degree", help="Pipeline parallel degree"),
+    dp_degree: Optional[int] = typer.Option(None, "--dp-degree", help="Data parallel degree"),
+    interconnect: str = typer.Option(
+        "unknown",
+        "--interconnect",
+        help="Interconnect: pcie, nvlink, infiniband, unknown",
+    ),
     param_count_b: Optional[float] = typer.Option(None, "--param-count-b", "-p", help="Param count in billions (overrides model lookup)"),
     batch_size: int = typer.Option(32, help="Batch size"),
     seq_length: int = typer.Option(2048, help="Sequence length"),
@@ -288,6 +309,14 @@ def scan(
         "strategy": strategy,
         "gpu_type": gpu,
         "num_gpus": num_gpus,
+        "objective": objective,
+        "max_budget_hourly": max_budget_hourly,
+        "num_nodes": num_nodes,
+        "gpus_per_node": gpus_per_node,
+        "tp_degree": tp_degree,
+        "pp_degree": pp_degree,
+        "dp_degree": dp_degree,
+        "interconnect_type": interconnect,
         "batch_size": batch_size,
         "seq_length": seq_length,
         "hidden_dim": hidden_dim,
@@ -303,8 +332,9 @@ def scan(
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
+        endpoint = "/scans" if token else "/scans/cli"
         with httpx.Client(timeout=30) as client:
-            resp = client.post(f"{api_url}/scans/cli", json=payload, headers=headers)
+            resp = client.post(f"{api_url}{endpoint}", json=payload, headers=headers)
             resp.raise_for_status()
             result = resp.json()
 
@@ -672,24 +702,11 @@ def _try_upload(artifact_path: str) -> None:
 
 def _read_callback_data():
     # type: () -> Optional[dict]
-    """Read callback data from sidecar file written by framework callbacks.
-
-    Reads .alloc_callback.json first (new format with timing),
-    falls back to .alloc_steps.json (legacy step-count-only format).
-    """
+    """Read callback data from .alloc_callback.json."""
     try:
-        # New format: full timing data
         callback_path = os.path.join(os.getcwd(), ".alloc_callback.json")
         if os.path.isfile(callback_path):
             with open(callback_path, "r") as f:
-                return json_mod.load(f)
-    except Exception:
-        pass
-    try:
-        # Legacy format: step count only
-        steps_path = os.path.join(os.getcwd(), ".alloc_steps.json")
-        if os.path.isfile(steps_path):
-            with open(steps_path, "r") as f:
                 return json_mod.load(f)
     except Exception:
         pass
@@ -720,10 +737,24 @@ def _print_scan_result(result: dict, gpu: str, strategy: str) -> None:
     feasible = verdict.get("feasible", False)
     status = "[green]FEASIBLE[/green]" if feasible else "[red]INFEASIBLE[/red]"
     console.print(f"  Strategy: {strategy.upper()} on {gpu} — {status}")
+    if verdict.get("strategy_topology"):
+        console.print(f"  [dim]Topology: {verdict['strategy_topology']}[/dim]")
+    if verdict.get("objective"):
+        console.print(f"  [dim]Objective: {verdict['objective']}[/dim]")
+    if verdict.get("effective_max_budget_hourly") is not None:
+        console.print(
+            f"  [dim]Effective budget cap: ${float(verdict['effective_max_budget_hourly']):.4f}/hr[/dim]"
+        )
 
     if not feasible and verdict.get("recommendation"):
-        rec = verdict["recommendation"]
-        console.print(f"  [yellow]Suggestion: switch to {rec.upper()}[/yellow]")
+        rec = verdict.get("best_recommendation") or {}
+        if rec.get("strategy_topology"):
+            console.print(
+                f"  [yellow]Suggestion: {rec.get('strategy', '').upper()} "
+                f"({rec.get('strategy_topology')})[/yellow]"
+            )
+        else:
+            console.print(f"  [yellow]Suggestion: switch to {str(verdict['recommendation']).upper()}[/yellow]")
 
     if verdict.get("reason"):
         console.print(f"  [dim]{verdict['reason']}[/dim]")
@@ -852,3 +883,73 @@ def _print_gpu_context_detail(ctx: dict) -> None:
         for gpu, rate in overrides.items():
             lines.append(f"  Rate override   {gpu}: ${rate:.2f}/hr")
     console.print(Panel("\n".join(lines), title="GPU Context (.alloc.yaml)", border_style="cyan", padding=(1, 0)))
+
+
+def _infer_parallel_topology_from_env(*, num_gpus_detected: int) -> dict:
+    """Infer distributed topology hints from common launcher env vars."""
+
+    def _get_int(name: str) -> Optional[int]:
+        val = os.environ.get(name)
+        if val is None:
+            return None
+        try:
+            parsed = int(val)
+            return parsed if parsed > 0 else None
+        except Exception:
+            return None
+
+    world_size = _get_int("WORLD_SIZE")
+    local_world = _get_int("LOCAL_WORLD_SIZE")
+    nnodes = _get_int("NNODES")
+    gpn = local_world or num_gpus_detected or 1
+
+    if nnodes is None and world_size is not None and gpn > 0 and world_size % gpn == 0:
+        nnodes = max(1, world_size // gpn)
+
+    tp = _get_int("TP_SIZE") or _get_int("TENSOR_PARALLEL_SIZE")
+    pp = _get_int("PP_SIZE") or _get_int("PIPELINE_PARALLEL_SIZE")
+    dp = _get_int("DP_SIZE") or _get_int("DATA_PARALLEL_SIZE")
+
+    if dp is None and world_size is not None:
+        denom = (tp or 1) * (pp or 1)
+        if denom > 0 and world_size % denom == 0:
+            dp = max(1, world_size // denom)
+
+    interconnect = os.environ.get("ALLOC_INTERCONNECT", "").strip().lower() or "unknown"
+    if interconnect not in ("pcie", "nvlink", "infiniband", "unknown"):
+        interconnect = "unknown"
+
+    return {
+        "num_nodes": nnodes or 1,
+        "gpus_per_node": gpn,
+        "tp_degree": tp,
+        "pp_degree": pp,
+        "dp_degree": dp,
+        "interconnect_type": interconnect,
+    }
+
+
+def _objective_from_context(ctx: Optional[dict]) -> str:
+    """Resolve ranking objective from .alloc.yaml priority."""
+    if not ctx:
+        return "best_value"
+    priority_cost = int(ctx.get("priority_cost", 50))
+    if priority_cost >= 70:
+        return "cheapest"
+    if priority_cost <= 30:
+        return "fastest"
+    return "best_value"
+
+
+def _max_budget_hourly_from_context(ctx: Optional[dict]) -> Optional[float]:
+    """Resolve hourly budget from .alloc.yaml context."""
+    if not ctx:
+        return None
+    val = ctx.get("budget_hourly")
+    if val is None:
+        return None
+    try:
+        parsed = float(val)
+        return parsed if parsed > 0 else None
+    except Exception:
+        return None

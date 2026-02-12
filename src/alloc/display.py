@@ -319,9 +319,6 @@ def _stop_reason_label(stop_reason, calibration_duration_s=None):
     if stop_reason == "process_exit":
         return "training process exited"
 
-    if stop_reason == "probe_steps":
-        return "probe-steps limit reached"
-
     return "unknown"
 
 

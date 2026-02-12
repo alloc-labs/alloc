@@ -23,7 +23,6 @@ class StopReason(str, Enum):
     STABLE = "stable"
     TIMEOUT = "timeout"
     PROCESS_EXIT = "process_exit"
-    PROBE_STEPS = "probe_steps"
     ERROR = "error"
 
 
@@ -149,7 +148,6 @@ def probe_command(
     poll_interval_ms=500,  # type: int
     timeout_seconds=120,  # type: int
     gpu_index=0,  # type: int
-    probe_steps=None,  # type: Optional[int]
     calibrate=True,  # type: bool
 ):
     # type: (...) -> ProbeResult
@@ -160,8 +158,6 @@ def probe_command(
         poll_interval_ms: How often to poll GPU metrics (default 500ms)
         timeout_seconds: Max time to monitor (default 120s)
         gpu_index: Which GPU to monitor (default 0)
-        probe_steps: If set, stop after metrics stabilize or this many samples
-                     post-ramp-up. Sends SIGTERM to the process cleanly.
         calibrate: If True (default), auto-stop when metrics stabilize.
 
     Returns:
@@ -293,16 +289,8 @@ def probe_command(
                 except Exception:
                     pass
 
-                # Short-run mode: check if we should stop
-                if probe_steps is not None and len(samples) > ramp_up_samples:
-                    post_ramp = len(samples) - ramp_up_samples
-                    if post_ramp >= probe_steps or _check_stable(samples):
-                        stop_reason_ref[0] = StopReason.PROBE_STEPS.value
-                        stop_event.set()
-                        break
-
                 # Calibrate mode: auto-stop when stable
-                if calibrate and probe_steps is None and len(samples) > ramp_up_samples:
+                if calibrate and len(samples) > ramp_up_samples:
                     from alloc.stability import check_stability, RAMP_UP_SAMPLES
                     sr = check_stability(samples, poll_interval_ms=poll_interval_ms)
                     if sr.is_stable:
@@ -325,28 +313,7 @@ def probe_command(
 
     start_time = time.time()
 
-    if probe_steps is not None:
-        # Legacy short-run mode: wait for stop_event or timeout
-        while not stop_event.is_set() and proc.poll() is None:
-            elapsed = time.time() - start_time
-            if timeout_seconds > 0 and elapsed >= timeout_seconds:
-                stop_reason_ref[0] = StopReason.TIMEOUT.value
-                break
-            stop_event.wait(0.5)
-
-        if proc.poll() is not None and stop_reason_ref[0] is None:
-            stop_reason_ref[0] = StopReason.PROCESS_EXIT.value
-
-        # Gracefully terminate the process
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-    elif calibrate:
+    if calibrate:
         # Calibrate mode (new default): wait for stability, process exit, or timeout
         while not stop_event.is_set() and proc.poll() is None:
             elapsed = time.time() - start_time
@@ -389,10 +356,8 @@ def probe_command(
     duration = time.time() - start_time
 
     # Determine probe_mode
-    if calibrate and probe_steps is None:
+    if calibrate:
         mode = "calibrate"
-    elif probe_steps is not None:
-        mode = "short_run"
     else:
         mode = "full"
 
@@ -436,7 +401,7 @@ def probe_command(
         ],
         exit_code=proc.returncode,
         probe_mode=mode,
-        steps_profiled=len(samples) if probe_steps else None,
+        steps_profiled=None,
         stop_reason=stop_reason_ref[0],
         gpu_name=gpu_info_ref[0],
         gpu_total_vram_mb=gpu_info_ref[1],
