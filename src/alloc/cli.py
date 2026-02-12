@@ -655,6 +655,9 @@ def _try_upload(artifact_path: str) -> None:
         result = upload_artifact(artifact_path, api_url, token)
         run_id = result.get("run_id", "unknown")
         console.print(f"[green]Uploaded.[/green] Run ID: {run_id}")
+        budget_warning = result.get("budget_warning")
+        if budget_warning:
+            console.print(f"[yellow]{budget_warning}[/yellow]")
     except UploadLimitError as e:
         detail = e.detail
         used = detail.get("used", "?")
