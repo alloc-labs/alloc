@@ -189,10 +189,10 @@ class TestAllocCallbackTiming:
         assert cb._batch_size == 32  # 16 * 2
 
 
-# ── Backward compatibility ───────────────────────────────────────────────
+# ── Sidecar discovery ────────────────────────────────────────────────────
 
 
-class TestBackwardCompat:
+class TestSidecarDiscovery:
     def test_read_callback_data_new_format(self, tmp_path, monkeypatch):
         """_read_callback_data reads .alloc_callback.json."""
         monkeypatch.chdir(tmp_path)
@@ -205,16 +205,15 @@ class TestBackwardCompat:
         assert result["step_count"] == 100
         assert result["step_time_ms_p50"] == 50.0
 
-    def test_read_callback_data_legacy_fallback(self, tmp_path, monkeypatch):
-        """_read_callback_data falls back to .alloc_steps.json."""
+    def test_read_callback_data_legacy_file_ignored(self, tmp_path, monkeypatch):
+        """Legacy .alloc_steps.json is ignored (no backward-compat shims)."""
         monkeypatch.chdir(tmp_path)
         data = {"framework": "huggingface", "step_count": 42}
         (tmp_path / ".alloc_steps.json").write_text(json.dumps(data))
 
         from alloc.cli import _read_callback_data
         result = _read_callback_data()
-        assert result is not None
-        assert result["step_count"] == 42
+        assert result is None
 
     def test_read_callback_data_prefers_new(self, tmp_path, monkeypatch):
         """When both files exist, .alloc_callback.json wins."""

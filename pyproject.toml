@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alloc"
-version = "0.3.1"
-description = "Training cost intelligence for ML workloads: estimate fit, profile runs, and ship budget-aware GPU decisions."
+version = "0.4.0"
+description = "Engineer-first training calibration: estimate VRAM fit, profile short runs, and pick GPU configs under real budget constraints."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.8"

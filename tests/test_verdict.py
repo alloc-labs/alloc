@@ -140,7 +140,7 @@ def test_stop_reason_process_exit():
 
 def test_stop_reason_probe_steps():
     label = _stop_reason_label("probe_steps")
-    assert "probe-steps" in label
+    assert label == "unknown"
 
 
 def test_stop_reason_unknown():
