@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alloc"
 version = "0.3.1"
-description = "GPU intelligence for ML training — right-size before you launch."
+description = "Training cost intelligence for ML workloads: estimate fit, profile runs, and ship budget-aware GPU decisions."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.8"
