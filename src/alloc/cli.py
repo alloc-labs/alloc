@@ -1049,9 +1049,20 @@ def _print_scan_result(result: dict, gpu: str, strategy: str) -> None:
     if verdict.get("objective"):
         console.print(f"  [dim]Objective: {verdict['objective']}[/dim]")
     if verdict.get("effective_max_budget_hourly") is not None:
-        console.print(
-            f"  [dim]Effective budget cap: ${float(verdict['effective_max_budget_hourly']):.4f}/hr[/dim]"
-        )
+        if verdict.get("budget_cap_applied"):
+            user_cap = verdict.get("user_max_budget_hourly")
+            org_cap = verdict.get("org_max_budget_hourly")
+            eff_cap = float(verdict["effective_max_budget_hourly"])
+            console.print("  [dim]Budget:[/dim]")
+            if user_cap is not None:
+                console.print(f"    [dim]Your cap:      ${float(user_cap):.4f}/hr[/dim]")
+            if org_cap is not None:
+                console.print(f"    [dim]Org ceiling:   ${float(org_cap):.4f}/hr[/dim]")
+            console.print(f"    [dim]Effective cap: ${eff_cap:.4f}/hr (org ceiling applied)[/dim]")
+        else:
+            console.print(
+                f"  [dim]Effective budget cap: ${float(verdict['effective_max_budget_hourly']):.4f}/hr[/dim]"
+            )
 
     if not feasible and verdict.get("recommendation"):
         rec = verdict.get("best_recommendation") or {}
