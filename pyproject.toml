@@ -7,7 +7,7 @@ name = "alloc"
 version = "0.4.1"
 description = "Engineer-first training calibration: estimate VRAM fit, profile short runs, and pick GPU configs under real budget constraints."
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.8"
 authors = [{name = "Alloc Labs", email = "hello@alloclabs.com"}]
 classifiers = [
