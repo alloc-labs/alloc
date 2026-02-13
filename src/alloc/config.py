@@ -36,7 +36,10 @@ def save_config(data: dict) -> None:
     try:
         cfg_dir = _config_dir()
         cfg_dir.mkdir(parents=True, exist_ok=True)
-        _config_file().write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(cfg_dir, 0o700)
+        cfg_file = _config_file()
+        cfg_file.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(cfg_file, 0o600)
     except Exception:
         pass
 
