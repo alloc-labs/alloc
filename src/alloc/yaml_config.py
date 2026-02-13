@@ -17,6 +17,13 @@ import yaml
 CONFIG_FILENAME = ".alloc.yaml"
 GLOBAL_PREFS_PATH = Path.home() / ".alloc" / "preferences.yaml"
 
+_ALLOWED_OBJECTIVES = {
+    "cheapest",
+    "fastest",
+    "fastest_within_budget",
+    "best_value",
+}
+
 
 @dataclass
 class FleetEntry:
@@ -35,6 +42,7 @@ class AllocConfig:
 
     fleet: List[FleetEntry] = field(default_factory=list)
     explore: List[FleetEntry] = field(default_factory=list)
+    objective: Optional[str] = None  # cheapest | fastest | fastest_within_budget | best_value
     priority_cost: int = 50         # 0-100, latency = 100 - cost
     budget_monthly: Optional[float] = None  # Monthly budget in USD
     budget_hourly: Optional[float] = None   # Hourly budget cap
@@ -70,6 +78,9 @@ class AllocConfig:
     def to_dict(self) -> dict:
         """Serialize to dict suitable for YAML output."""
         d = {}  # type: dict
+
+        if self.objective is not None:
+            d["objective"] = self.objective
 
         if self.fleet:
             d["fleet"] = [_entry_to_dict(e) for e in self.fleet]
@@ -133,6 +144,11 @@ def validate_config(config: AllocConfig) -> List[str]:
     """Validate an AllocConfig. Returns list of error strings (empty = valid)."""
     errors = []
 
+    if config.objective is not None and config.objective not in _ALLOWED_OBJECTIVES:
+        errors.append(
+            f"objective must be one of {sorted(_ALLOWED_OBJECTIVES)}, got {config.objective}"
+        )
+
     if config.priority_cost < 0 or config.priority_cost > 100:
         errors.append(f"priority.cost must be 0-100, got {config.priority_cost}")
 
@@ -194,6 +210,10 @@ def _find_config(explicit_path: Optional[str] = None) -> Optional[str]:
 
 def _parse_config(raw: dict) -> AllocConfig:
     """Parse raw YAML dict into AllocConfig."""
+    objective = raw.get("objective")
+    if not isinstance(objective, str) or not objective.strip():
+        objective = None
+
     fleet = []
     for item in raw.get("fleet", []):
         if isinstance(item, str):
@@ -230,6 +250,7 @@ def _parse_config(raw: dict) -> AllocConfig:
     return AllocConfig(
         fleet=fleet,
         explore=explore,
+        objective=objective,
         priority_cost=priority_cost,
         budget_monthly=budget_monthly,
         budget_hourly=budget_hourly,

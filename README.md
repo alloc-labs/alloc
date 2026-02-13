@@ -90,8 +90,28 @@ Wraps your command, monitors GPU memory/utilization/power via `pynvml`, and writ
 
 ```bash
 alloc login
-# Prompts for email + password, stores token in ~/.alloc/config.json
+# Prompts for email + password, stores token + refresh_token in ~/.alloc/config.json
+
+alloc login --token <ACCESS_TOKEN>
+# Paste an access token from the dashboard (no password prompt)
 ```
+
+### `alloc whoami`: Show current auth + org context
+
+```bash
+alloc whoami
+alloc whoami --json
+```
+
+Prints the current identity (when logged in), plus objective, effective budget cap, and fleet counts.
+
+### `alloc logout`: Clear local session
+
+```bash
+alloc logout
+```
+
+Clears saved `token`/`refresh_token` from `~/.alloc/config.json`.
 
 ### `alloc upload`: Upload artifact to dashboard
 
@@ -100,6 +120,8 @@ alloc upload alloc_artifact.json.gz
 ```
 
 Uploads a previously saved `.json.gz` artifact to the dashboard via `POST /runs/ingest`. Requires authentication (`alloc login` first).
+
+If your session token has expired and a `refresh_token` is available (password login flow), `alloc upload` refreshes once and retries automatically.
 
 ### `alloc catalog`: Browse GPU hardware catalog
 
@@ -118,6 +140,7 @@ Offline reference for GPU specs, interconnect details, and cloud pricing. Suppor
 ```bash
 alloc init                     # interactive wizard
 alloc init --yes               # non-interactive defaults (full catalog, 50/50 priority)
+alloc init --from-org --yes    # pull fleet/budget/objective from your org (requires alloc login)
 ```
 
 Creates a `.alloc.yaml` file in the current directory with your GPU fleet, explore list, budget, and priority weights. When present, `ghost`, `run`, and `scan` automatically use fleet context for recommendations. Use `--no-config` on any command to skip it.

@@ -47,6 +47,7 @@ def test_parse_full_config():
         "explore": [
             {"gpu": "H200"},
         ],
+        "objective": "fastest_within_budget",
         "priority": {"cost": 70, "latency": 30},
         "budget": {"monthly_usd": 5000, "hourly_usd": 50},
     })
@@ -55,6 +56,7 @@ def test_parse_full_config():
     assert cfg.fleet[0].count == 8
     assert len(cfg.explore) == 1
     assert cfg.explore[0].explore is True
+    assert cfg.objective == "fastest_within_budget"
     assert cfg.priority_cost == 70
     assert cfg.priority_latency == 30
     assert cfg.budget_monthly == 5000

@@ -21,7 +21,7 @@ from rich.console import Console
 import json as json_mod
 
 from alloc import __version__
-from alloc.config import get_api_url, get_token, should_upload
+from alloc.config import get_api_url, get_token, should_upload, try_refresh_access_token
 
 app = typer.Typer(
     name="alloc",
@@ -362,10 +362,44 @@ def scan(
 
 
 @app.command()
-def login():
+def login(
+    method: str = typer.Option(
+        "password",
+        "--method",
+        help="Auth method: password (Supabase) or token (paste an access token)",
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="Access token (implies token login). If omitted, you'll be prompted.",
+    ),
+):
     """Authenticate with Alloc dashboard."""
     import httpx
     from alloc.config import get_supabase_url, get_supabase_anon_key, load_config, save_config
+
+    method = (method or "").strip().lower()
+    if token is not None and method == "password":
+        # UX: allow `alloc login --token <...>` without requiring `--method token`.
+        method = "token"
+    if method not in ("password", "token"):
+        console.print("[red]Invalid --method. Use: password or token[/red]")
+        raise typer.Exit(2)
+
+    if method == "token":
+        access_token = token or typer.prompt("Access token", hide_input=True)
+        if not access_token.strip():
+            console.print("[red]Login failed: empty token.[/red]")
+            raise typer.Exit(1)
+
+        cfg = load_config()
+        cfg["token"] = access_token.strip()
+        cfg.pop("refresh_token", None)  # token paste mode cannot refresh automatically
+        cfg.pop("email", None)
+        cfg["api_url"] = get_api_url()
+        save_config(cfg)
+        console.print("[green]Saved token.[/green]")
+        return
 
     email = typer.prompt("Email")
     password = typer.prompt("Password", hide_input=True)
@@ -386,14 +420,14 @@ def login():
             resp.raise_for_status()
             data = resp.json()
 
-        token = data.get("access_token", "")
+        access_token = data.get("access_token", "")
         refresh = data.get("refresh_token", "")
-        if not token:
+        if not access_token:
             console.print("[red]Login failed: no access token received.[/red]")
             raise typer.Exit(1)
 
         cfg = load_config()
-        cfg["token"] = token
+        cfg["token"] = access_token
         cfg["refresh_token"] = refresh
         cfg["email"] = email
         cfg["api_url"] = get_api_url()
@@ -417,6 +451,124 @@ def login():
 
 
 @app.command()
+def logout():
+    """Log out (clear saved token from local config)."""
+    from alloc.config import load_config, save_config
+
+    cfg = load_config()
+    had = bool(cfg.get("token") or cfg.get("refresh_token") or cfg.get("email"))
+
+    cfg.pop("token", None)
+    cfg.pop("refresh_token", None)
+    cfg.pop("email", None)
+    save_config(cfg)
+
+    if had:
+        console.print("[green]Logged out.[/green]")
+    else:
+        console.print("[dim]No saved session found.[/dim]")
+
+    if os.environ.get("ALLOC_TOKEN"):
+        console.print("[dim]Note: ALLOC_TOKEN is set in your environment and still overrides local config.[/dim]")
+
+
+@app.command()
+def whoami(
+    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Show current CLI auth + org context."""
+    import httpx
+    from alloc.config import get_api_url, get_token
+
+    api_url = get_api_url()
+    token = get_token()
+    token_source = "env" if os.environ.get("ALLOC_TOKEN") else "config"
+
+    out = {
+        "api_url": api_url,
+        "logged_in": bool(token),
+        "token_source": token_source if token else None,
+    }
+
+    if not token:
+        if json_output:
+            _print_json(out)
+        else:
+            console.print("[yellow]Not logged in.[/yellow]")
+            console.print("[dim]Run: alloc login[/dim]")
+        return
+
+    def _get(path: str) -> dict:
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(f"{api_url}{path}", headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    try:
+        profile = _get("/profile")
+        fleet = _get("/gpu-fleet")
+    except httpx.HTTPStatusError as e:
+        new_token = try_refresh_access_token() if e.response.status_code == 401 else None
+        if new_token:
+            # Retry once with refreshed token
+            token = new_token
+            profile = _get("/profile")
+            fleet = _get("/gpu-fleet")
+        else:
+            if json_output:
+                out["error"] = f"API error {e.response.status_code}"
+                _print_json(out)
+            else:
+                console.print(f"[red]API error {e.response.status_code}[/red]")
+                console.print("[dim]Run: alloc login[/dim]")
+            raise typer.Exit(1)
+    except httpx.ConnectError:
+        if json_output:
+            out["error"] = f"Cannot connect to {api_url}"
+            _print_json(out)
+        else:
+            console.print(f"[red]Cannot connect to {api_url}[/red]")
+        raise typer.Exit(1)
+
+    gpus = fleet.get("gpus") or []
+    fleet_count = len([g for g in gpus if g.get("fleet_status") == "in_fleet"])
+    explore_count = len([g for g in gpus if g.get("fleet_status") == "explore"])
+
+    out.update({
+        "email": profile.get("email"),
+        "user_id": profile.get("user_id"),
+        "onboarding_complete": profile.get("onboarding_complete"),
+        "objective": fleet.get("objective"),
+        "priority_cost": fleet.get("priority_cost"),
+        "budget_monthly_usd": fleet.get("budget_monthly"),
+        "effective_budget_monthly_usd": fleet.get("effective_budget_monthly"),
+        "budget_cap_applied": fleet.get("budget_cap_applied"),
+        "fleet_count": fleet_count,
+        "explore_count": explore_count,
+        "org_budget": fleet.get("org_budget"),
+    })
+
+    if json_output:
+        _print_json(out)
+        return
+
+    email = out.get("email") or "(unknown)"
+    console.print(f"[green]Logged in[/green] as {email}")
+    console.print(f"[dim]API: {api_url}[/dim]")
+    if out.get("objective"):
+        console.print(f"[dim]Objective: {out['objective']}[/dim]")
+    if out.get("effective_budget_monthly_usd") is not None:
+        cap = float(out["effective_budget_monthly_usd"])
+        line = f"[dim]Effective budget cap: ${cap:.2f}/mo[/dim]"
+        if out.get("budget_cap_applied"):
+            line += " [yellow](org cap applied)[/yellow]"
+        console.print(line)
+    console.print(f"[dim]Fleet GPUs: {fleet_count}, Explore GPUs: {explore_count}[/dim]")
+    console.print()
+
+
+@app.command()
 def upload(
     artifact: str = typer.Argument(..., help="Path to alloc artifact (.json.gz)"),
 ):
@@ -435,6 +587,7 @@ def upload(
 @app.command()
 def init(
     yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive: full catalog, 50/50 priority, no budget"),
+    from_org: bool = typer.Option(False, "--from-org", help="Pull fleet/budget from your org (requires alloc login)"),
 ):
     """Create .alloc.yaml with GPU fleet, explore, budget, and priority."""
     from alloc.yaml_config import AllocConfig, FleetEntry, write_alloc_config, validate_config
@@ -445,6 +598,142 @@ def init(
             overwrite = typer.confirm(".alloc.yaml already exists. Overwrite?", default=False)
             if not overwrite:
                 raise typer.Exit(0)
+
+    if from_org:
+        import httpx
+
+        token = get_token()
+        if not token:
+            console.print("[yellow]Not logged in. Run `alloc login` first.[/yellow]")
+            raise typer.Exit(1)
+
+        api_url = get_api_url()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        def _fetch() -> dict:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(f"{api_url}/gpu-fleet", headers=headers)
+                resp.raise_for_status()
+                return resp.json()
+
+        try:
+            payload = _fetch()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                new_token = try_refresh_access_token()
+                if not new_token:
+                    console.print("[yellow]Session expired. Run `alloc login` again.[/yellow]")
+                    raise typer.Exit(1)
+                headers["Authorization"] = f"Bearer {new_token}"
+                payload = _fetch()
+            else:
+                console.print(f"[red]API error {e.response.status_code}[/red]")
+                console.print(f"[dim]{e.response.text[:200]}[/dim]")
+                raise typer.Exit(1)
+        except httpx.ConnectError:
+            console.print(f"[red]Cannot connect to {api_url}[/red]")
+            raise typer.Exit(1)
+
+        catalog = list_gpus()
+        display_to_id = {g["display_name"]: g["id"] for g in catalog}
+
+        unknown = []  # type: list[str]
+
+        def _resolve_gpu_id(display_name: str) -> str:
+            resolved = display_to_id.get(display_name)
+            if resolved:
+                return resolved
+            unknown.append(display_name)
+            return display_name
+
+        fleet_entries = []
+        explore_entries = []
+        for g in payload.get("gpus") or []:
+            status = (g.get("fleet_status") or "").strip().lower()
+            if status not in ("in_fleet", "explore"):
+                continue
+
+            display = (g.get("display_name") or g.get("gpu_id") or "").strip()
+            if not display:
+                continue
+
+            gpu_id = _resolve_gpu_id(display)
+
+            count = None
+            if g.get("max_count") is not None:
+                try:
+                    parsed = int(g["max_count"])
+                    count = parsed if parsed > 0 else None
+                except Exception:
+                    count = None
+
+            rate = None
+            if g.get("rate") is not None and g.get("rate_source") in ("user", "org"):
+                try:
+                    parsed = float(g["rate"])
+                    rate = parsed if parsed >= 0 else None
+                except Exception:
+                    rate = None
+
+            entry = FleetEntry(
+                gpu=gpu_id,
+                cloud=g.get("cloud"),
+                count=count,
+                rate=rate,
+                explore=(status == "explore"),
+            )
+            if status == "explore":
+                explore_entries.append(entry)
+            else:
+                fleet_entries.append(entry)
+
+        budget_monthly = payload.get("effective_budget_monthly")
+        if budget_monthly is not None:
+            try:
+                budget_monthly = float(budget_monthly)
+            except Exception:
+                budget_monthly = None
+        budget_hourly = None
+        if budget_monthly is not None and budget_monthly > 0:
+            # Match API behavior: budgets are enforced hourly using monthly/730.
+            budget_hourly = round(float(budget_monthly) / 730.0, 4)
+
+        config = AllocConfig(
+            fleet=fleet_entries,
+            explore=explore_entries,
+            objective=payload.get("objective"),
+            priority_cost=int(payload.get("priority_cost") or 50),
+            budget_monthly=budget_monthly,
+            budget_hourly=budget_hourly,
+        )
+
+        errors = validate_config(config)
+        if errors:
+            for err in errors:
+                console.print(f"[red]{err}[/red]")
+            raise typer.Exit(1)
+
+        path = write_alloc_config(config)
+        console.print(f"\n[green]Created {path}[/green] [dim](from org)[/dim]")
+        console.print(f"  Fleet: {len(config.fleet)} GPUs, Explore: {len(config.explore)} GPUs")
+        if config.objective:
+            console.print(f"  Objective: {config.objective}")
+        console.print(f"  Priority: cost={config.priority_cost}, latency={config.priority_latency}")
+        if config.budget_monthly:
+            console.print(f"  Budget: ${config.budget_monthly:.0f}/mo")
+            if config.budget_hourly:
+                console.print(f"  Budget cap: ${config.budget_hourly:.4f}/hr [dim](monthly/730)[/dim]")
+        if payload.get("budget_cap_applied"):
+            console.print("  [yellow]Note: org cap applied to effective budget[/yellow]")
+        if unknown:
+            uniq = sorted(set(unknown))
+            console.print("  [yellow]Warning:[/yellow] some GPUs were not found in the local catalog:")
+            for name in uniq[:10]:
+                console.print(f"    [dim]- {name}[/dim]")
+            if len(uniq) > 10:
+                console.print(f"    [dim]... (+{len(uniq) - 10} more)[/dim]")
+        console.print()
+        return
 
     gpus = list_gpus()
 
@@ -673,6 +962,7 @@ def _print_json(data: dict) -> None:
 def _try_upload(artifact_path: str) -> None:
     """Attempt to upload an artifact. Prints status, never raises."""
     try:
+        import httpx
         from alloc.upload import upload_artifact, UploadLimitError
 
         token = get_token()
@@ -682,7 +972,16 @@ def _try_upload(artifact_path: str) -> None:
 
         api_url = get_api_url()
         console.print(f"[dim]Uploading to {api_url}...[/dim]")
-        result = upload_artifact(artifact_path, api_url, token)
+        try:
+            result = upload_artifact(artifact_path, api_url, token)
+        except httpx.HTTPStatusError as e:
+            new_token = try_refresh_access_token() if e.response.status_code == 401 else None
+            if new_token:
+                console.print("[dim]Session expired; refreshed token. Retrying...[/dim]")
+                result = upload_artifact(artifact_path, api_url, new_token)
+            else:
+                raise
+
         run_id = result.get("run_id", "unknown")
         console.print(f"[green]Uploaded.[/green] Run ID: {run_id}")
         budget_warning = result.get("budget_warning")
@@ -695,6 +994,14 @@ def _try_upload(artifact_path: str) -> None:
         console.print(f"[yellow]Upload limit reached ({used}/{limit} this month).[/yellow]")
         console.print("[dim]Upgrade to Pro for more uploads. Artifact is saved locally.[/dim]")
         console.print(f"[dim]  {artifact_path}[/dim]")
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        if status == 401:
+            console.print("[yellow]Session expired. Run `alloc login` again.[/yellow]")
+        else:
+            console.print(f"[yellow]Upload failed: API error {status}[/yellow]")
+            console.print(f"[dim]{e.response.text[:200]}[/dim]")
+        console.print(f"[dim]You can retry later: alloc upload {artifact_path}[/dim]")
     except Exception as e:
         console.print(f"[yellow]Upload failed: {e}[/yellow]")
         console.print(f"[dim]You can retry later: alloc upload {artifact_path}[/dim]")
@@ -836,6 +1143,7 @@ def _load_gpu_context(no_config: bool) -> Optional[dict]:
         return {
             "fleet": config.fleet_gpu_ids,
             "explore": config.explore_gpu_ids,
+            "objective": config.objective,
             "priority_cost": config.priority_cost,
             "priority_latency": config.priority_latency,
             "budget_monthly": config.budget_monthly,
@@ -930,9 +1238,12 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int) -> dict:
 
 
 def _objective_from_context(ctx: Optional[dict]) -> str:
-    """Resolve ranking objective from .alloc.yaml priority."""
+    """Resolve ranking objective from .alloc.yaml."""
     if not ctx:
         return "best_value"
+    explicit = (ctx.get("objective") or "").strip().lower()
+    if explicit in ("cheapest", "fastest", "fastest_within_budget", "best_value"):
+        return explicit
     priority_cost = int(ctx.get("priority_cost", 50))
     if priority_cost >= 70:
         return "cheapest"
