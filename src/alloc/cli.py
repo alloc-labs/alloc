@@ -221,16 +221,19 @@ def run(
             context=env_context if env_context else None,
         )
 
+    # Build budget context for verdict display
+    budget_ctx = _build_budget_context(gpu_context, result)
+
     if json_output:
         from alloc.display import build_verdict_dict
-        data = build_verdict_dict(result, artifact_path=artifact_path, step_count=step_count, callback_data=callback_data)
+        data = build_verdict_dict(result, artifact_path=artifact_path, step_count=step_count, callback_data=callback_data, budget_context=budget_ctx)
         if result.error:
             data["error"] = result.error
         _print_json(data)
     else:
         # Display verdict for all modes when we have GPU data
         if result.peak_vram_mb > 0:
-            print_verdict(result, artifact_path=artifact_path, step_count=step_count, callback_data=callback_data)
+            print_verdict(result, artifact_path=artifact_path, step_count=step_count, callback_data=callback_data, budget_context=budget_ctx)
             if verbose:
                 from alloc.display import print_verbose_run
                 print_verbose_run(result, step_count=step_count)
@@ -1225,6 +1228,45 @@ def _objective_from_context(ctx: Optional[dict]) -> str:
     if priority_cost <= 30:
         return "fastest"
     return "best_value"
+
+
+def _build_budget_context(gpu_context, probe_result):
+    # type: (Optional[dict], Any) -> Optional[dict]
+    """Build budget context dict for verdict display from gpu_context + probe result."""
+    if not gpu_context:
+        return None
+    budget_monthly = gpu_context.get("budget_monthly")
+    rate_overrides = gpu_context.get("rate_overrides") or {}
+
+    # Look up cost_per_hour: first try rate overrides from .alloc.yaml, then catalog
+    gpu_name = getattr(probe_result, "gpu_name", None) or ""
+    cost_per_hour = None
+
+    # Check rate overrides (user's .alloc.yaml rates)
+    for gpu_id, rate in rate_overrides.items():
+        if gpu_id.lower() in gpu_name.lower() or gpu_name.lower() in gpu_id.lower():
+            cost_per_hour = rate
+            break
+
+    # Fallback: look up from catalog
+    if cost_per_hour is None and gpu_name:
+        try:
+            from alloc.catalog import get_default_rate
+            cost_per_hour = get_default_rate(gpu_name)
+        except Exception:
+            pass
+
+    if cost_per_hour is None and budget_monthly is None:
+        return None
+
+    num_gpus = getattr(probe_result, "num_gpus_detected", 1) or 1
+    if cost_per_hour is not None:
+        cost_per_hour = cost_per_hour * num_gpus
+
+    return {
+        "cost_per_hour": cost_per_hour,
+        "budget_monthly": budget_monthly,
+    }
 
 
 def _max_budget_hourly_from_context(ctx: Optional[dict]) -> Optional[float]:

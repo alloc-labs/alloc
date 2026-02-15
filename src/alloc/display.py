@@ -92,8 +92,8 @@ def print_probe_result(result: ProbeResult) -> None:
 # --- Verdict display for calibrate-and-exit mode ---
 
 
-def print_verdict(result, artifact_path="", step_count=None, callback_data=None):
-    # type: (ProbeResult, str, Optional[int], Optional[dict]) -> None
+def print_verdict(result, artifact_path="", step_count=None, callback_data=None, budget_context=None):
+    # type: (ProbeResult, str, Optional[int], Optional[dict], Optional[dict]) -> None
     """Print a verdict summary panel after calibration."""
     vram_util_pct = result.vram_utilization_pct
     bottleneck = _classify_bottleneck_local(
@@ -167,6 +167,18 @@ def print_verdict(result, artifact_path="", step_count=None, callback_data=None)
                 lines.append(f"  Throughput      {sps:.1f} samples/sec")
             if dl_wait is not None and dl_wait > 15:
                 lines.append(f"  Dataloader      ~{dl_wait:.0f}% wait (consider more workers)")
+
+        # Budget projection from .alloc.yaml context
+        if budget_context:
+            cph = budget_context.get("cost_per_hour")
+            budget_mo = budget_context.get("budget_monthly")
+            if cph is not None and cph > 0:
+                # Assume 8 hrs/day * 22 working days/month = 176 hrs
+                monthly_est = cph * 176
+                lines.append(f"  Est. monthly    ~${monthly_est:,.0f}/mo at current rate (8h/day)")
+                if budget_mo is not None and budget_mo > 0:
+                    pct = (monthly_est / budget_mo) * 100
+                    lines.append(f"  Budget          {pct:.0f}% of ${budget_mo:,.0f}/mo")
 
         if recommendation:
             lines.append("")
@@ -322,8 +334,8 @@ def _stop_reason_label(stop_reason, calibration_duration_s=None):
     return "unknown"
 
 
-def build_verdict_dict(result, artifact_path="", step_count=None, callback_data=None):
-    # type: (ProbeResult, str, Optional[int], Optional[dict]) -> dict
+def build_verdict_dict(result, artifact_path="", step_count=None, callback_data=None, budget_context=None):
+    # type: (ProbeResult, str, Optional[int], Optional[dict], Optional[dict]) -> dict
     """Build a verdict dict with the same data as print_verdict, for JSON output."""
     vram_util_pct = result.vram_utilization_pct
     bottleneck = _classify_bottleneck_local(
@@ -370,6 +382,18 @@ def build_verdict_dict(result, artifact_path="", step_count=None, callback_data=
             val = callback_data.get(key)
             if val is not None:
                 d[key] = val
+    # Include budget projection
+    if budget_context:
+        cph = budget_context.get("cost_per_hour")
+        budget_mo = budget_context.get("budget_monthly")
+        if cph is not None and cph > 0:
+            monthly_est = cph * 176
+            d["budget_projection"] = {
+                "cost_per_hour": cph,
+                "est_monthly": round(monthly_est, 2),
+                "budget_monthly": budget_mo,
+                "budget_pct": round((monthly_est / budget_mo) * 100, 1) if budget_mo and budget_mo > 0 else None,
+            }
     return d
 
 

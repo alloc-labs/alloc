@@ -76,6 +76,35 @@ def list_gpus() -> List[dict]:
     return sorted(result, key=lambda x: x["vram_gb"], reverse=True)
 
 
+def get_default_rate(gpu_name: str) -> Optional[float]:
+    """Look up the average default $/hr for a GPU by name or alias.
+
+    Tries to match the probe-reported GPU name against catalog display names.
+    Returns the average across clouds, or None if not found.
+    """
+    rate_card = _load_rate_card()
+    rates = rate_card.get("rates", {})
+
+    # Direct match by display name
+    for display_name, cloud_rates in rates.items():
+        if display_name.lower() in gpu_name.lower() or gpu_name.lower() in display_name.lower():
+            vals = [v for v in cloud_rates.values() if isinstance(v, (int, float))]
+            return sum(vals) / len(vals) if vals else None
+
+    # Try aliases → display name
+    for alias, stable_id in _ALIASES.items():
+        if alias.lower() in gpu_name.lower():
+            catalog = _load_catalog()
+            spec = catalog.get("gpus", {}).get(stable_id)
+            if spec:
+                dn = spec.get("display_name", "")
+                cloud_rates = rates.get(dn, {})
+                vals = [v for v in cloud_rates.values() if isinstance(v, (int, float))]
+                return sum(vals) / len(vals) if vals else None
+
+    return None
+
+
 def get_gpu(gpu_id: str) -> Optional[dict]:
     """Look up a GPU by stable ID or alias.
 
