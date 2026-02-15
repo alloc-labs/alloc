@@ -178,7 +178,10 @@ def print_verdict(result, artifact_path="", step_count=None, callback_data=None,
                 lines.append(f"  Est. monthly    ~${monthly_est:,.0f}/mo at current rate (8h/day)")
                 if budget_mo is not None and budget_mo > 0:
                     pct = (monthly_est / budget_mo) * 100
-                    lines.append(f"  Budget          {pct:.0f}% of ${budget_mo:,.0f}/mo")
+                    cap_note = ""
+                    if budget_context.get("budget_cap_applied"):
+                        cap_note = " (org cap applied)"
+                    lines.append(f"  Budget          {pct:.0f}% of ${budget_mo:,.0f}/mo{cap_note}")
 
         if recommendation:
             lines.append("")
@@ -393,6 +396,8 @@ def build_verdict_dict(result, artifact_path="", step_count=None, callback_data=
                 "est_monthly": round(monthly_est, 2),
                 "budget_monthly": budget_mo,
                 "budget_pct": round((monthly_est / budget_mo) * 100, 1) if budget_mo and budget_mo > 0 else None,
+                "budget_cap_applied": budget_context.get("budget_cap_applied", False),
+                "org_budget_monthly": budget_context.get("org_budget_monthly"),
             }
     return d
 

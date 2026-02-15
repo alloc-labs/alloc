@@ -24,6 +24,13 @@ _ALLOWED_OBJECTIVES = {
     "best_value",
 }
 
+_ALLOWED_INTERCONNECTS = {
+    "pcie",
+    "nvlink",
+    "infiniband",
+    "unknown",
+}
+
 
 @dataclass
 class FleetEntry:
@@ -46,6 +53,8 @@ class AllocConfig:
     priority_cost: int = 50         # 0-100, latency = 100 - cost
     budget_monthly: Optional[float] = None  # Monthly budget in USD
     budget_hourly: Optional[float] = None   # Hourly budget cap
+    org_budget_monthly: Optional[float] = None  # Org ceiling (from --from-org sync)
+    interconnect: Optional[str] = None  # pcie | nvlink | infiniband | unknown
 
     @property
     def priority_latency(self) -> int:
@@ -97,6 +106,11 @@ class AllocConfig:
             d.setdefault("budget", {})["monthly_usd"] = self.budget_monthly
         if self.budget_hourly is not None:
             d.setdefault("budget", {})["hourly_usd"] = self.budget_hourly
+        if self.org_budget_monthly is not None:
+            d.setdefault("budget", {})["org_ceiling_usd"] = self.org_budget_monthly
+
+        if self.interconnect is not None:
+            d["interconnect"] = self.interconnect
 
         return d
 
@@ -147,6 +161,11 @@ def validate_config(config: AllocConfig) -> List[str]:
     if config.objective is not None and config.objective not in _ALLOWED_OBJECTIVES:
         errors.append(
             f"objective must be one of {sorted(_ALLOWED_OBJECTIVES)}, got {config.objective}"
+        )
+
+    if config.interconnect is not None and config.interconnect not in _ALLOWED_INTERCONNECTS:
+        errors.append(
+            f"interconnect must be one of {sorted(_ALLOWED_INTERCONNECTS)}, got {config.interconnect}"
         )
 
     if config.priority_cost < 0 or config.priority_cost > 100:
@@ -246,6 +265,15 @@ def _parse_config(raw: dict) -> AllocConfig:
     budget = raw.get("budget", {})
     budget_monthly = budget.get("monthly_usd") if isinstance(budget, dict) else None
     budget_hourly = budget.get("hourly_usd") if isinstance(budget, dict) else None
+    org_budget_monthly = budget.get("org_ceiling_usd") if isinstance(budget, dict) else None
+
+    interconnect = raw.get("interconnect")
+    if isinstance(interconnect, str) and interconnect.strip():
+        interconnect = interconnect.strip().lower()
+        if interconnect not in _ALLOWED_INTERCONNECTS:
+            interconnect = None
+    else:
+        interconnect = None
 
     return AllocConfig(
         fleet=fleet,
@@ -254,4 +282,6 @@ def _parse_config(raw: dict) -> AllocConfig:
         priority_cost=priority_cost,
         budget_monthly=budget_monthly,
         budget_hourly=budget_hourly,
+        org_budget_monthly=org_budget_monthly,
+        interconnect=interconnect,
     )

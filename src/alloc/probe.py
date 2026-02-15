@@ -59,6 +59,7 @@ class ProbeResult:
     num_gpus_detected: int = 1
     process_map: Optional[list] = None
     per_gpu_peak_vram_mb: Optional[list] = None
+    detected_interconnect: Optional[str] = None  # "nvlink", "pcie", or None
 
     @property
     def peak_vram_gb(self) -> float:
@@ -148,6 +149,30 @@ def _discover_gpu_indices(proc_pid, pynvml, fallback_index=0):
     return found_indices if found_indices else [fallback_index]
 
 
+def _detect_interconnect(handles, pynvml):
+    # type: (list, ...) -> Optional[str]
+    """Detect GPU interconnect type using NVML topology API.
+
+    Checks topology between GPU pairs. Returns "nvlink" if any pair
+    is connected via NVLink, "pcie" if all pairs use PCIe, or None
+    if detection fails or only one GPU.
+    """
+    if len(handles) < 2:
+        return None
+    try:
+        # Check topology between first two GPU handles
+        # NVML topology levels: SINGLE(10)=NVLink, MULTIPLE(20)=NVLink multi-hop,
+        # HOSTBRIDGE(30)=PCIe bridge, NODE(40)=same NUMA, SYSTEM(50)=cross-socket
+        level = pynvml.nvmlDeviceGetTopologyCommonAncestor(handles[0], handles[1])
+        # pynvml may return an int or an enum; normalize to int
+        level_val = int(level) if not isinstance(level, int) else level
+        if level_val <= 20:
+            return "nvlink"
+        return "pcie"
+    except Exception:
+        return None
+
+
 def probe_command(
     command,  # type: list
     *,
@@ -212,6 +237,7 @@ def probe_command(
     num_gpus_ref = [1]  # type: list[int]
     process_map_ref = [None]  # type: list
     per_gpu_peaks_ref = [{}]  # type: list[dict]  # {handle_idx: peak_vram_mb}
+    detected_ic_ref = [None]  # type: list[Optional[str]]
 
     def _monitor():
         try:
@@ -269,6 +295,8 @@ def probe_command(
                             process_map_ref[0] = pmap
                     except Exception:
                         pass
+                    # Detect interconnect type between discovered GPUs
+                    detected_ic_ref[0] = _detect_interconnect(handles, pynvml)
                     discovery_done = True
 
                 # Sample from all monitored GPUs — aggregate: peak vram = max, util/power = mean
@@ -392,6 +420,7 @@ def probe_command(
             sm_version=hw_info_ref[2],
             num_gpus_detected=num_gpus_ref[0],
             process_map=process_map_ref[0],
+            detected_interconnect=detected_ic_ref[0],
         )
 
     peak_vram = max(s.memory_used_mb for s in samples)
@@ -428,4 +457,5 @@ def probe_command(
             [round(per_gpu_peaks_ref[0].get(i, 0), 1) for i in range(num_gpus_ref[0])]
             if len(per_gpu_peaks_ref[0]) > 1 else None
         ),
+        detected_interconnect=detected_ic_ref[0],
     )

@@ -170,7 +170,11 @@ def run(
     # Discover environment context (git, container, Ray)
     from alloc.context import discover_context
     env_context = discover_context()
-    topology = _infer_parallel_topology_from_env(num_gpus_detected=result.num_gpus_detected)
+    topology = _infer_parallel_topology_from_env(
+        num_gpus_detected=result.num_gpus_detected,
+        config_interconnect=gpu_context.get("interconnect") if gpu_context else None,
+        detected_interconnect=result.detected_interconnect,
+    )
     objective = os.environ.get("ALLOC_OBJECTIVE", "").strip().lower() or _objective_from_context(gpu_context)
     max_budget_hourly = _max_budget_hourly_from_context(gpu_context)
 
@@ -707,6 +711,21 @@ def init(
             # Match API behavior: budgets are enforced hourly using monthly/730.
             budget_hourly = round(float(budget_monthly) / 730.0, 4)
 
+        # Preserve org ceiling so CLI can show "(org cap applied)"
+        org_budget_raw = payload.get("org_budget") or {}
+        org_ceiling = org_budget_raw.get("budget_monthly_usd") if isinstance(org_budget_raw, dict) else None
+        if org_ceiling is not None:
+            try:
+                org_ceiling = float(org_ceiling)
+            except Exception:
+                org_ceiling = None
+
+        # Resolve org interconnect preference
+        org_interconnect = None
+        raw_ic = payload.get("interconnect")
+        if isinstance(raw_ic, str) and raw_ic.strip().lower() in ("pcie", "nvlink", "infiniband"):
+            org_interconnect = raw_ic.strip().lower()
+
         config = AllocConfig(
             fleet=fleet_entries,
             explore=explore_entries,
@@ -714,6 +733,8 @@ def init(
             priority_cost=int(payload.get("priority_cost") or 50),
             budget_monthly=budget_monthly,
             budget_hourly=budget_hourly,
+            org_budget_monthly=org_ceiling,
+            interconnect=org_interconnect,
         )
 
         errors = validate_config(config)
@@ -732,6 +753,8 @@ def init(
             console.print(f"  Budget: ${config.budget_monthly:.0f}/mo")
             if config.budget_hourly:
                 console.print(f"  Budget cap: ${config.budget_hourly:.4f}/hr [dim](monthly/730)[/dim]")
+        if config.interconnect:
+            console.print(f"  Interconnect: {config.interconnect}")
         if payload.get("budget_cap_applied"):
             console.print("  [yellow]Note: org cap applied to effective budget[/yellow]")
         if unknown:
@@ -825,11 +848,22 @@ def init(
             except ValueError:
                 budget_monthly = None
 
+        # 5. Interconnect
+        console.print("\n[bold]Interconnect[/bold] — GPU-to-GPU communication fabric:")
+        console.print("  1. Unknown (auto-detect at runtime)")
+        console.print("  2. PCIe")
+        console.print("  3. NVLink")
+        console.print("  4. InfiniBand")
+        ic_choice = typer.prompt("Choose", default="1")
+        ic_map = {"1": None, "2": "pcie", "3": "nvlink", "4": "infiniband"}
+        interconnect_val = ic_map.get(ic_choice.strip())
+
         config = AllocConfig(
             fleet=fleet_entries,
             explore=explore_entries,
             priority_cost=priority_cost,
             budget_monthly=budget_monthly,
+            interconnect=interconnect_val,
         )
 
     errors = validate_config(config)
@@ -846,6 +880,8 @@ def init(
     console.print(f"  Priority: cost={config.priority_cost}, latency={config.priority_latency}")
     if config.budget_monthly:
         console.print(f"  Budget: ${config.budget_monthly:.0f}/mo")
+    if config.interconnect:
+        console.print(f"  Interconnect: {config.interconnect}")
     console.print()
 
 
@@ -1131,6 +1167,8 @@ def _load_gpu_context(no_config: bool) -> Optional[dict]:
             "budget_monthly": config.budget_monthly,
             "budget_hourly": config.budget_hourly,
             "rate_overrides": config.rate_overrides,
+            "org_budget_monthly": config.org_budget_monthly,
+            "interconnect": config.interconnect,
         }
     except Exception:
         return None
@@ -1175,7 +1213,7 @@ def _print_gpu_context_detail(ctx: dict) -> None:
     console.print(Panel("\n".join(lines), title="GPU Context (.alloc.yaml)", border_style="cyan", padding=(1, 0)))
 
 
-def _infer_parallel_topology_from_env(*, num_gpus_detected: int) -> dict:
+def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_interconnect: Optional[str] = None, detected_interconnect: Optional[str] = None) -> dict:
     """Infer distributed topology hints from common launcher env vars."""
 
     def _get_int(name: str) -> Optional[int]:
@@ -1205,7 +1243,14 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int) -> dict:
         if denom > 0 and world_size % denom == 0:
             dp = max(1, world_size // denom)
 
-    interconnect = os.environ.get("ALLOC_INTERCONNECT", "").strip().lower() or "unknown"
+    # Priority: env var > NVML probe detection > .alloc.yaml config > "unknown"
+    interconnect = os.environ.get("ALLOC_INTERCONNECT", "").strip().lower()
+    if not interconnect and detected_interconnect:
+        interconnect = detected_interconnect
+    if not interconnect and config_interconnect:
+        interconnect = config_interconnect
+    if not interconnect:
+        interconnect = "unknown"
     if interconnect not in ("pcie", "nvlink", "infiniband", "unknown"):
         interconnect = "unknown"
 
@@ -1267,9 +1312,18 @@ def _build_budget_context(gpu_context, probe_result):
     if cost_per_hour is not None:
         cost_per_hour = cost_per_hour * num_gpus
 
+    org_budget = gpu_context.get("org_budget_monthly")
+    budget_cap_applied = (
+        budget_monthly is not None
+        and org_budget is not None
+        and budget_monthly >= org_budget
+    )
+
     return {
         "cost_per_hour": cost_per_hour,
         "budget_monthly": budget_monthly,
+        "org_budget_monthly": org_budget,
+        "budget_cap_applied": budget_cap_applied,
     }
 
 
