@@ -58,6 +58,7 @@ class ProbeResult:
     sm_version: Optional[str] = None
     num_gpus_detected: int = 1
     process_map: Optional[list] = None
+    per_gpu_peak_vram_mb: Optional[list] = None
 
     @property
     def peak_vram_gb(self) -> float:
@@ -210,6 +211,7 @@ def probe_command(
     calibration_time_ref = [None]  # type: list[Optional[float]]
     num_gpus_ref = [1]  # type: list[int]
     process_map_ref = [None]  # type: list
+    per_gpu_peaks_ref = [{}]  # type: list[dict]  # {handle_idx: peak_vram_mb}
 
     def _monitor():
         try:
@@ -283,6 +285,12 @@ def probe_command(
                         util_vals.append(ut.gpu)
                         power_vals.append(pw)
                         total_mb = mi.total / (1024 * 1024)
+
+                    # Track per-GPU peak VRAM for multi-GPU runs
+                    if len(handles) > 1:
+                        pgp = per_gpu_peaks_ref[0]
+                        for gi, vm in enumerate(vram_vals):
+                            pgp[gi] = max(pgp.get(gi, 0.0), vm)
 
                     samples.append(ProbeSample(
                         timestamp=time.time(),
@@ -416,4 +424,8 @@ def probe_command(
         sm_version=hw_info_ref[2],
         num_gpus_detected=num_gpus_ref[0],
         process_map=process_map_ref[0],
+        per_gpu_peak_vram_mb=(
+            [round(per_gpu_peaks_ref[0].get(i, 0), 1) for i in range(num_gpus_ref[0])]
+            if len(per_gpu_peaks_ref[0]) > 1 else None
+        ),
     )

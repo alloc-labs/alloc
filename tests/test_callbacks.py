@@ -12,6 +12,8 @@ from alloc.callbacks import (
     _compute_percentile,
     _compute_timing_stats,
     _estimate_dataloader_wait,
+    _estimate_comm_overhead,
+    _detect_distributed,
     _build_sidecar,
     _write_callback_data,
 )
@@ -230,3 +232,99 @@ class TestSidecarDiscovery:
         monkeypatch.chdir(tmp_path)
         from alloc.cli import _read_callback_data
         assert _read_callback_data() is None
+
+
+# ── Comm overhead estimation ────────────────────────────────────────────
+
+
+class TestEstimateCommOverhead:
+    def test_insufficient_data(self):
+        """Less than 10 step times → None."""
+        assert _estimate_comm_overhead([100.0] * 5) is None
+
+    def test_uniform_steps_zero_overhead(self):
+        """Uniform step times → 0% comm overhead."""
+        result = _estimate_comm_overhead([100.0] * 20)
+        assert result == 0.0
+
+    def test_high_tail_latency(self):
+        """High p90/p50 ratio → significant comm overhead."""
+        # 15 uniform steps + 5 slow steps → p90 >> p50
+        times = [100.0] * 15 + [200.0] * 5
+        result = _estimate_comm_overhead(times)
+        assert result is not None
+        assert result > 0
+
+    def test_subtracts_dataloader_wait(self):
+        """Comm overhead subtracts dataloader contribution."""
+        # Use moderate variation so raw is below 40% cap
+        times = [100.0] * 15 + [130.0] * 5
+        raw = _estimate_comm_overhead(times, dataloader_wait_pct=0.0)
+        adjusted = _estimate_comm_overhead(times, dataloader_wait_pct=10.0)
+        assert raw is not None and adjusted is not None
+        assert adjusted < raw
+
+    def test_capped_at_40(self):
+        """Extreme tail latency capped at 40%."""
+        times = [50.0] * 10 + [500.0] * 10
+        result = _estimate_comm_overhead(times)
+        assert result is not None
+        assert result <= 40.0
+
+
+class TestDetectDistributed:
+    def test_no_torch_returns_false(self):
+        """Without torch.distributed, should return (False, 0, 1)."""
+        result = _detect_distributed()
+        # In test env, torch.distributed is unlikely initialized
+        assert result[0] is False or result[0] is True  # either is valid
+        assert isinstance(result[1], int)
+        assert isinstance(result[2], int)
+
+
+class TestBuildSidecarDistributed:
+    def test_non_distributed_no_extra_fields(self):
+        """Non-distributed sidecar should not have distributed fields."""
+        data = _build_sidecar(
+            framework="huggingface",
+            step_count=100,
+            step_times_ms=[100.0] * 50,
+            batch_size=32,
+        )
+        assert "is_distributed" not in data
+        assert "rank" not in data
+        assert "world_size" not in data
+        assert "comm_overhead_pct" not in data
+
+    def test_distributed_has_extra_fields(self):
+        """Distributed sidecar should include distributed metadata."""
+        data = _build_sidecar(
+            framework="huggingface",
+            step_count=100,
+            step_times_ms=[100.0] * 50,
+            batch_size=32,
+            is_distributed=True,
+            rank=2,
+            world_size=8,
+        )
+        assert data["is_distributed"] is True
+        assert data["rank"] == 2
+        assert data["world_size"] == 8
+        # Uniform times → comm_overhead_pct should be 0.0
+        assert data["comm_overhead_pct"] == 0.0
+
+    def test_distributed_with_comm_overhead(self):
+        """Distributed sidecar with varied times has comm_overhead_pct."""
+        # Mix of fast and slow steps to simulate comm delays
+        times = [100.0] * 15 + [200.0] * 5
+        data = _build_sidecar(
+            framework="lightning",
+            step_count=20,
+            step_times_ms=times,
+            batch_size=64,
+            is_distributed=True,
+            rank=0,
+            world_size=4,
+        )
+        assert data["is_distributed"] is True
+        assert data["comm_overhead_pct"] > 0

@@ -202,10 +202,14 @@ def run(
         }
         # Merge timing fields from callback sidecar
         if callback_data:
-            for key in ("step_time_ms_p50", "step_time_ms_p90", "samples_per_sec", "dataloader_wait_pct"):
+            for key in ("step_time_ms_p50", "step_time_ms_p90", "samples_per_sec",
+                         "dataloader_wait_pct", "comm_overhead_pct"):
                 val = callback_data.get(key)
                 if val is not None:
                     probe_dict[key] = val
+        # Merge per-GPU peak VRAM from probe (maps to per_rank_peak_vram_mb)
+        if result.per_gpu_peak_vram_mb:
+            probe_dict["per_rank_peak_vram_mb"] = result.per_gpu_peak_vram_mb
         hw_context = {
             "gpu_name": result.gpu_name,
             "gpu_total_vram_mb": result.gpu_total_vram_mb,

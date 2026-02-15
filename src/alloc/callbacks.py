@@ -81,6 +81,42 @@ def _estimate_dataloader_wait(cv):
     return round((cv - 0.1) / 0.4 * 30.0, 1)
 
 
+def _detect_distributed():
+    # type: () -> tuple
+    """Detect if running inside a torch.distributed process group.
+
+    Returns (is_distributed, rank, world_size). Fail-safe: returns
+    (False, 0, 1) if torch.distributed is unavailable or not initialized.
+    """
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            return True, dist.get_rank(), dist.get_world_size()
+    except Exception:
+        pass
+    return False, 0, 1
+
+
+def _estimate_comm_overhead(step_times_ms, dataloader_wait_pct=0.0):
+    # type: (List[float], float) -> Optional[float]
+    """Estimate communication overhead % for distributed training.
+
+    Uses the p90/p50 spread as a proxy for sync barrier delays.
+    Subtracts estimated dataloader contribution to avoid double-counting.
+    Returns None if insufficient data.
+    """
+    if len(step_times_ms) < 10:
+        return None
+    sorted_vals = sorted(step_times_ms)
+    p50 = _compute_percentile(sorted_vals, 50)
+    p90 = _compute_percentile(sorted_vals, 90)
+    if p50 <= 0:
+        return None
+    raw_pct = ((p90 - p50) / p50) * 100
+    comm_pct = max(0.0, raw_pct - dataloader_wait_pct)
+    return round(min(40.0, comm_pct), 1)
+
+
 def _write_callback_data(data):
     # type: (Dict[str, Any]) -> None
     """Write callback data to the alloc sidecar file.
@@ -101,6 +137,9 @@ def _build_sidecar(
     step_count,      # type: int
     step_times_ms,   # type: List[float]
     batch_size,      # type: Optional[int]
+    is_distributed=False,  # type: bool
+    rank=0,          # type: int
+    world_size=1,    # type: int
 ):
     # type: (...) -> Dict[str, Any]
     """Build the sidecar dict from collected timing data."""
@@ -124,6 +163,15 @@ def _build_sidecar(
         "batch_size": batch_size,
         "dataloader_wait_pct": dataloader_wait_pct,
     }
+
+    if is_distributed:
+        data["is_distributed"] = True
+        data["rank"] = rank
+        data["world_size"] = world_size
+        comm = _estimate_comm_overhead(step_times_ms, dataloader_wait_pct)
+        if comm is not None:
+            data["comm_overhead_pct"] = comm
+
     return data
 
 
@@ -142,9 +190,17 @@ try:
             self._step_start = None      # type: Optional[float]
             self._batch_size = None      # type: Optional[int]
             self._last_write_step = 0    # type: int
+            self._dist_checked = False   # type: bool
+            self._is_distributed = False  # type: bool
+            self._rank = 0               # type: int
+            self._world_size = 1         # type: int
 
         def on_step_begin(self, args, state, control, **kwargs):
             self._step_start = time.monotonic()
+            # Detect distributed once after process group is initialized
+            if not self._dist_checked:
+                self._is_distributed, self._rank, self._world_size = _detect_distributed()
+                self._dist_checked = True
 
         def on_step_end(self, args, state, control, **kwargs):
             self.step_count = state.global_step
@@ -183,6 +239,9 @@ try:
                 step_count=self.step_count,
                 step_times_ms=self._step_times_ms,
                 batch_size=self._batch_size,
+                is_distributed=self._is_distributed,
+                rank=self._rank,
+                world_size=self._world_size,
             )
             _write_callback_data(data)
 
@@ -214,9 +273,16 @@ try:
             self._step_start = None      # type: Optional[float]
             self._batch_size = None      # type: Optional[int]
             self._last_write_step = 0    # type: int
+            self._dist_checked = False   # type: bool
+            self._is_distributed = False  # type: bool
+            self._rank = 0               # type: int
+            self._world_size = 1         # type: int
 
         def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
             self._step_start = time.monotonic()
+            if not self._dist_checked:
+                self._is_distributed, self._rank, self._world_size = _detect_distributed()
+                self._dist_checked = True
 
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
             self.step_count = trainer.global_step
@@ -259,6 +325,9 @@ try:
                 step_count=self.step_count,
                 step_times_ms=self._step_times_ms,
                 batch_size=self._batch_size,
+                is_distributed=self._is_distributed,
+                rank=self._rank,
+                world_size=self._world_size,
             )
             _write_callback_data(data)
 
