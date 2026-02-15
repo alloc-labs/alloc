@@ -8,7 +8,6 @@ Graceful no-op if pynvml is not installed or no GPU is available.
 
 from __future__ import annotations
 
-import os
 import signal
 import subprocess
 import sys
@@ -99,7 +98,13 @@ def _get_child_pids(pid):
     # type: (int) -> List[int]
     """Get child PIDs of a process. Returns empty list on failure."""
     try:
-        out = os.popen(f"pgrep -P {pid}").read().strip()
+        result = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        out = result.stdout.strip()
         if out:
             return [int(p) for p in out.split("\n") if p.strip()]
     except Exception:

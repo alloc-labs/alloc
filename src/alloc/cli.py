@@ -344,13 +344,12 @@ def scan(
             _print_scan_result(result, gpu, strategy)
     except httpx.HTTPStatusError as e:
         if json_output:
-            _print_json({"error": f"API error {e.response.status_code}", "detail": e.response.text[:200]})
+            _print_json({"error": f"API error {e.response.status_code}"})
         elif e.response.status_code == 403:
             console.print("[yellow]AI analysis requires a Pro or Enterprise plan.[/yellow]")
             console.print("[dim]The scan still works — just without Euler AI analysis.[/dim]")
         else:
             console.print(f"[red]API error {e.response.status_code}[/red]")
-            console.print(f"[dim]{e.response.text[:200]}[/dim]")
         raise typer.Exit(1)
     except httpx.ConnectError:
         if json_output:
@@ -435,11 +434,14 @@ def login(
 
         console.print(f"[green]Logged in as {email}[/green]")
     except httpx.HTTPStatusError as e:
-        detail = ""
+        detail = "authentication error"
         try:
-            detail = e.response.json().get("error_description", e.response.text[:200])
+            body = e.response.json()
+            desc = body.get("error_description", "")
+            if desc in ("Invalid login credentials", "Email not confirmed"):
+                detail = desc.lower()
         except Exception:
-            detail = e.response.text[:200]
+            pass
         console.print(f"[red]Login failed: {detail}[/red]")
         raise typer.Exit(1)
     except httpx.ConnectError:
@@ -1094,48 +1096,10 @@ def _print_scan_result(result: dict, gpu: str, strategy: str) -> None:
     console.print()
 
 
-# Well-known model names → param count in billions
-_MODEL_PARAMS = {
-    "llama-3-70b": 70.0,
-    "llama-3-8b": 8.03,
-    "llama-2-70b": 70.0,
-    "llama-2-13b": 13.0,
-    "llama-2-7b": 7.0,
-    "mistral-7b": 7.24,
-    "mixtral-8x7b": 46.7,
-    "gpt2": 0.124,
-    "gpt2-medium": 0.355,
-    "gpt2-large": 0.774,
-    "gpt2-xl": 1.5,
-    "bert-base": 0.110,
-    "bert-large": 0.340,
-    "t5-small": 0.060,
-    "t5-base": 0.220,
-    "t5-large": 0.770,
-    "t5-xl": 3.0,
-    "t5-xxl": 11.0,
-    "falcon-7b": 7.0,
-    "falcon-40b": 40.0,
-    "phi-2": 2.78,
-    "gemma-2b": 2.51,
-    "gemma-7b": 8.54,
-    "qwen-7b": 7.72,
-    "qwen-14b": 14.2,
-    "qwen-72b": 72.7,
-    "deepseek-7b": 6.9,
-    "deepseek-67b": 67.0,
-    "vit-base": 0.086,
-    "vit-large": 0.307,
-    "whisper-small": 0.244,
-    "whisper-medium": 0.769,
-    "whisper-large": 1.55,
-}
-
-
 def _model_to_params(model: str) -> Optional[float]:
     """Look up model param count by name."""
-    normalized = model.lower().strip()
-    return _MODEL_PARAMS.get(normalized)
+    from alloc.model_registry import lookup_model_params
+    return lookup_model_params(model)
 
 
 # ---------------------------------------------------------------------------

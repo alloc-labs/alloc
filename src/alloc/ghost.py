@@ -12,19 +12,26 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any, Optional
 
+# Canonical dtype → bytes mapping. Keep in sync with apps/api/src/engine/vram.py.
 BYTES_PER_DTYPE = {
     "float32": 4,
     "float16": 2,
     "bfloat16": 2,
     "int8": 1,
-    # Shorthand aliases
+    "int4": 0.5,
+    # Shorthand aliases (torch uses long names, API uses short names)
     "fp32": 4,
     "fp16": 2,
     "bf16": 2,
 }
 
 # Adam: params (fp32) + momentum (fp32) + variance (fp32) = 3 states * 4 bytes
+# Keep in sync with OPTIMIZER_MULTIPLIER_FP16 in apps/api/src/engine/vram.py.
 OPTIMIZER_BYTES_PER_PARAM = 12
+
+# Buffer overhead: 10% of (weights + gradients + activations + optimizer)
+# for fragmentation and temp allocations.
+BUFFER_OVERHEAD_FACTOR = 0.1
 
 
 @dataclass
@@ -129,7 +136,7 @@ def _ghost_impl(
     gradients_gb = gradients_bytes * to_gb
     optimizer_gb = optimizer_bytes * to_gb
     activations_gb = activations_bytes * to_gb
-    buffer_gb = 0.1 * (weights_gb + gradients_gb + optimizer_gb + activations_gb)
+    buffer_gb = BUFFER_OVERHEAD_FACTOR * (weights_gb + gradients_gb + optimizer_gb + activations_gb)
     total_gb = weights_gb + gradients_gb + optimizer_gb + activations_gb + buffer_gb
 
     return GhostReport(
