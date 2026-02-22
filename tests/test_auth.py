@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,6 +12,7 @@ import httpx
 from typer.testing import CliRunner
 
 from alloc.cli import app
+from alloc.browser_auth import _generate_pkce_pair, _find_open_port
 
 
 runner = CliRunner()
@@ -153,3 +156,152 @@ def test_upload_retries_after_refresh_on_401(tmp_path: Path):
     assert mock_upload.call_args_list[1].args[2] == "new-token"
     assert "Retrying" in result.output
     assert "Uploaded" in result.output
+
+
+# ── PKCE helpers ──────────────────────────────────────────────────────────
+
+
+def test_pkce_pair_generates_valid_s256_challenge():
+    """Verify that the challenge is the S256 hash of the verifier."""
+    verifier, challenge = _generate_pkce_pair()
+
+    # Recompute expected challenge from verifier.
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    assert challenge == expected
+    assert len(verifier) > 40  # tokens are ~86 chars
+
+
+def test_pkce_pair_unique():
+    """Each call should produce a unique pair."""
+    pair_a = _generate_pkce_pair()
+    pair_b = _generate_pkce_pair()
+    assert pair_a[0] != pair_b[0]
+    assert pair_a[1] != pair_b[1]
+
+
+def test_find_open_port_returns_int():
+    port = _find_open_port()
+    assert isinstance(port, int)
+    assert port >= 17256
+
+
+def test_find_open_port_skips_busy(tmp_path: Path):
+    """If a port is in use, the finder should skip it."""
+    import socket
+
+    # Bind the first port in the range.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 17256))
+    try:
+        port = _find_open_port(start=17256)
+        # Should return a port > 17256 since 17256 is busy.
+        assert port > 17256
+    finally:
+        s.close()
+
+
+# ── Browser login flow ───────────────────────────────────────────────────
+
+
+def test_browser_login_saves_tokens(tmp_path: Path):
+    """--browser flag triggers browser_login and saves tokens."""
+    mock_result = {
+        "access_token": "at-browser-123",
+        "refresh_token": "rt-browser-456",
+        "email": "oauth@example.com",
+    }
+
+    env = {
+        "HOME": str(tmp_path),
+        "ALLOC_API_URL": "https://api.example.com",
+    }
+
+    with patch("alloc.browser_auth.browser_login", return_value=mock_result):
+        result = runner.invoke(app, ["login", "--browser"], env=env)
+
+    assert result.exit_code == 0, result.output
+    assert "Logged in as oauth@example.com" in result.output
+
+    cfg = json.loads((tmp_path / ".alloc" / "config.json").read_text())
+    assert cfg["token"] == "at-browser-123"
+    assert cfg["refresh_token"] == "rt-browser-456"
+    assert cfg["email"] == "oauth@example.com"
+    assert cfg["api_url"] == "https://api.example.com"
+
+
+def test_browser_login_with_azure_provider(tmp_path: Path):
+    mock_result = {
+        "access_token": "at-azure",
+        "refresh_token": "rt-azure",
+        "email": "azure@example.com",
+    }
+
+    env = {
+        "HOME": str(tmp_path),
+        "ALLOC_API_URL": "https://api.example.com",
+    }
+
+    with patch("alloc.browser_auth.browser_login", return_value=mock_result) as mock_bl:
+        result = runner.invoke(
+            app, ["login", "--browser", "--provider", "azure"], env=env
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "azure@example.com" in result.output
+    # Verify provider was passed through.
+    mock_bl.assert_called_once()
+    assert mock_bl.call_args.kwargs["provider"] == "azure"
+
+
+def test_browser_login_invalid_provider(tmp_path: Path):
+    env = {"HOME": str(tmp_path)}
+    result = runner.invoke(
+        app, ["login", "--browser", "--provider", "facebook"], env=env
+    )
+    assert result.exit_code != 0
+    assert "Invalid --provider" in result.output
+
+
+def test_browser_login_timeout(tmp_path: Path):
+    env = {
+        "HOME": str(tmp_path),
+        "ALLOC_API_URL": "https://api.example.com",
+    }
+
+    with patch(
+        "alloc.browser_auth.browser_login",
+        side_effect=RuntimeError("Login timed out"),
+    ):
+        result = runner.invoke(app, ["login", "--browser"], env=env)
+
+    assert result.exit_code != 0
+    assert "Login timed out" in result.output
+
+
+def test_password_failure_shows_browser_hint(tmp_path: Path):
+    """When password login fails with 'Invalid login credentials', show --browser hint."""
+    req = httpx.Request("POST", "https://sb.example.com/auth/v1/token")
+    resp_body = json.dumps({"error_description": "Invalid login credentials"}).encode()
+    resp = httpx.Response(400, request=req, content=resp_body, headers={"content-type": "application/json"})
+    err = httpx.HTTPStatusError("400", request=req, response=resp)
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = False
+    mock_client.post.side_effect = err
+
+    env = {"HOME": str(tmp_path)}
+
+    with patch("httpx.Client", return_value=mock_client):
+        result = runner.invoke(
+            app,
+            ["login"],
+            input="test@example.com\nwrongpass\n",
+            env=env,
+        )
+
+    assert result.exit_code != 0
+    assert "invalid login credentials" in result.output.lower()
+    assert "alloc login --browser" in result.output

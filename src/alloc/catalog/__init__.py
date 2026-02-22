@@ -1,7 +1,6 @@
 """GPU catalog — offline hardware specs and pricing for CLI.
 
-Source of truth: apps/api/src/engine/catalog/gpus.v1.json
-This is a bundled copy for offline CLI use. Update when the API catalog changes.
+Bundled GPU specs and pricing for offline CLI use.
 """
 
 from __future__ import annotations

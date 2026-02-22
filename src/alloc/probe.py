@@ -222,7 +222,7 @@ def probe_command(
             proc.wait(timeout=10)
         return ProbeResult(
             exit_code=proc.returncode,
-            error="pynvml not installed — install with: pip install alloc[gpu]",
+            error="GPU monitoring unavailable — no NVIDIA driver detected",
             stop_reason=StopReason.ERROR.value,
         )
 

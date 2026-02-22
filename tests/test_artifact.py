@@ -126,3 +126,22 @@ def test_artifact_without_context():
             data = json.load(f)
 
         assert data["context"] is None
+
+
+def test_artifact_command_field():
+    """Artifact probe should include the command string when provided."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test.json.gz")
+        probe = {
+            "peak_vram_mb": 5000,
+            "command": "python train.py --epochs 10",
+        }
+        write_report(
+            probe_result=probe,
+            output_path=path,
+        )
+
+        with gzip.open(path, "rt") as f:
+            data = json.load(f)
+
+        assert data["probe"]["command"] == "python train.py --epochs 10"
