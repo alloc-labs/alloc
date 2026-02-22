@@ -196,18 +196,20 @@ def _build_patches(result: DiagnoseResult) -> List[str]:
         # Sort by line number
         diags.sort(key=lambda d: d.line_number)
 
+        # Single header per file, multiple hunks
+        rel_path = file_path
+        patch_lines = [
+            f"--- a/{rel_path}",
+            f"+++ b/{rel_path}",
+        ]
+
         for diag in diags:
             line = diag.line_number
-            rel_path = file_path
+            patch_lines.append(f"@@ -{line},1 +{line},1 @@")
+            patch_lines.append(f"-{diag.current_code}")
+            patch_lines.append(f"+{diag.suggested_code}")
 
-            patch_lines = [
-                f"--- a/{rel_path}",
-                f"+++ b/{rel_path}",
-                f"@@ -{line},1 +{line},1 @@",
-                f"-{diag.current_code}",
-                f"+{diag.suggested_code}",
-            ]
-            patches.append("\n".join(patch_lines))
+        patches.append("\n".join(patch_lines))
 
     return patches
 
@@ -226,20 +228,23 @@ def build_json_dict(result: DiagnoseResult) -> dict:
     """Build a JSON-serializable dict from DiagnoseResult."""
     findings_list = []
     for d in result.findings:
-        findings_list.append({
+        finding = {
             "rule_id": d.rule_id,
             "severity": d.severity,
             "category": d.category,
             "title": d.title,
             "file_path": d.file_path,
             "line_number": d.line_number,
+            "current_code": d.current_code,
             "current_value": d.current_value,
+            "suggested_code": d.suggested_code,
             "suggested_value": d.suggested_value,
             "rationale": d.rationale,
             "estimated_impact": d.estimated_impact,
             "confidence": d.confidence,
             "doc_url": d.doc_url,
-        })
+        }
+        findings_list.append(finding)
 
     hw = None
     if result.hardware_context:
@@ -416,21 +421,17 @@ def print_diagnose_efficiency(result: DiagnoseResult) -> None:
     # Visual bar
     compute_w = int(eff["compute_pct"] / 100 * 48)
     data_w = int(eff["data_loading_pct"] / 100 * 48)
-    comm_w = int(eff["communication_pct"] / 100 * 48)
-    other_w = max(0, 48 - compute_w - data_w - comm_w)
+    other_w = max(0, 48 - compute_w - data_w)
 
     bar = (
         "[green]" + "█" * compute_w + "[/green]"
         + "[yellow]" + "█" * data_w + "[/yellow]"
-        + "[blue]" + "█" * comm_w + "[/blue]"
         + "[dim]" + "░" * other_w + "[/dim]"
     )
     console.print(f"  {bar}")
     label = f"  [green]Compute: {eff['compute_pct']:.0f}%[/green]"
     if eff["data_loading_pct"] > 0:
         label += f"  [yellow]Data: {eff['data_loading_pct']:.0f}%[/yellow]"
-    if eff["communication_pct"] > 0:
-        label += f"  [blue]Comm: {eff['communication_pct']:.0f}%[/blue]"
     if eff["other_pct"] > 0:
         label += f"  [dim]Other: {eff['other_pct']:.0f}%[/dim]"
     console.print(label)
@@ -448,11 +449,6 @@ def print_diagnose_efficiency(result: DiagnoseResult) -> None:
         if eff["data_loading_pct"] > 20:
             dl_note += " — bottleneck candidate"
         table.add_row("Data loading", f"{eff['data_loading_ms']:.1f} ms", dl_note)
-    if eff["communication_pct"] > 0:
-        comm_note = f"{eff['communication_pct']:.0f}%"
-        if eff["communication_pct"] < 15:
-            comm_note += " — normal"
-        table.add_row("Communication", f"{eff['communication_ms']:.1f} ms", comm_note)
     if eff["other_pct"] > 0:
         table.add_row("Other/overhead", f"{eff['other_ms']:.1f} ms", f"{eff['other_pct']:.0f}%")
 
@@ -482,8 +478,6 @@ def _print_efficiency_plain(result: DiagnoseResult) -> None:
     print(f"  GPU compute:     {eff['compute_ms']:>8.1f} ms  ({eff['compute_pct']:.0f}%)")
     if eff["data_loading_pct"] > 0:
         print(f"  Data loading:    {eff['data_loading_ms']:>8.1f} ms  ({eff['data_loading_pct']:.0f}%)")
-    if eff["communication_pct"] > 0:
-        print(f"  Communication:   {eff['communication_ms']:>8.1f} ms  ({eff['communication_pct']:.0f}%)")
     bn = eff.get("bottleneck")
     if bn:
         print(f"\n  Bottleneck: {bn}")

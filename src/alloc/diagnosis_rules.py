@@ -43,7 +43,7 @@ class Diagnosis:
 
 def _replace_kwarg(source_line: str, name: str, old_val: str, new_val: str) -> str:
     """Replace name=old_val with name=new_val in source line."""
-    pattern = rf'{name}\s*=\s*{re.escape(old_val)}'
+    pattern = rf'{name}\s*=\s*{re.escape(old_val)}\b'
     replacement = f'{name}={new_val}'
     result = re.sub(pattern, replacement, source_line, count=1)
     return result
@@ -149,8 +149,8 @@ def rule_dl002_pin_memory(
     for dl in findings.dataloaders:
         if dl.pin_memory is True:
             continue
-        # Only fire if num_workers > 0 or not specified (default 0 makes pin_memory less useful)
-        if dl.num_workers is not None and dl.num_workers == 0:
+        # Skip if num_workers is 0 (explicit or default) — pin_memory less useful with main-thread loading
+        if dl.num_workers is None or dl.num_workers == 0:
             continue
 
         suggested_code = dl.location.source_line
@@ -1049,18 +1049,8 @@ def rule_thru003_reduce_grad_accum(
     if avg_util >= 70:
         return []
 
-    # Check for gradient accumulation via AST-extracted field or source text
+    # Check for gradient accumulation via AST-extracted field
     has_grad_accum = findings.gradient_accumulation_steps is not None
-    if not has_grad_accum:
-        # Fallback: scan source text for accumulation patterns
-        try:
-            import os
-            if os.path.isfile(findings.script_path):
-                with open(findings.script_path, "r") as f:
-                    source = f.read()
-                has_grad_accum = "gradient_accumulation" in source or "accumulation_steps" in source
-        except Exception:
-            pass
 
     if not has_grad_accum:
         return []
@@ -1161,20 +1151,29 @@ def _check_step_time_straggler(
     artifact: ArtifactData,
 ) -> List[Diagnosis]:
     """Check for step time stragglers across ranks."""
+    def _median(vals):
+        """Proper median: average of two middle elements for even-length lists."""
+        s = sorted(vals)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        mid = n // 2
+        if n % 2 == 0:
+            return (s[mid - 1] + s[mid]) / 2.0
+        return s[mid]
+
     rank_medians = []
     for rank_idx, times in enumerate(artifact.per_rank_step_times_ms):
         if not times:
             return []
-        sorted_times = sorted(times)
-        median_t = sorted_times[len(sorted_times) // 2]
+        median_t = _median(times)
         rank_medians.append((rank_idx, median_t))
 
     if not rank_medians:
         return []
 
     all_medians = [m for _, m in rank_medians]
-    sorted_medians = sorted(all_medians)
-    overall_median = sorted_medians[len(sorted_medians) // 2]
+    overall_median = _median(all_medians)
     if overall_median == 0:
         return []
 

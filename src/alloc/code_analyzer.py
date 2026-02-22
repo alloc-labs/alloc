@@ -513,7 +513,7 @@ def _find_distributed(
             continue
 
         # torch.compile
-        if fqn in ("torch.compile",) or fqn.endswith(".compile") and "torch" in fqn:
+        if fqn == "torch.compile" or (fqn.endswith(".compile") and "torch" in fqn):
             results.append(DistributedFinding(
                 location=_loc(script_path, node, lines),
                 kind="torch_compile",
@@ -638,6 +638,15 @@ _HF_TRAINER_NAMES = {
     "transformers.Seq2SeqTrainer",
     "Trainer",
     "Seq2SeqTrainer",
+    # trl subclass trainers
+    "trl.SFTTrainer",
+    "trl.DPOTrainer",
+    "trl.PPOTrainer",
+    "trl.RewardTrainer",
+    "SFTTrainer",
+    "DPOTrainer",
+    "PPOTrainer",
+    "RewardTrainer",
 }
 
 

@@ -278,13 +278,8 @@ def _build_efficiency(artifact: ArtifactData) -> Optional[Dict]:
         return None
 
     dl_pct = artifact.dataloader_wait_pct or 0.0
-    compute_pct = max(0.0, 100.0 - dl_pct)
     other_pct = 0.0
-
-    # If compute seems too high (>95%), redistribute a small amount to other
-    if compute_pct > 95 and dl_pct == 0:
-        other_pct = 2.0
-        compute_pct = 98.0
+    compute_pct = max(0.0, 100.0 - dl_pct - other_pct)
 
     dl_ms = p50 * dl_pct / 100.0
     compute_ms = p50 * compute_pct / 100.0
@@ -305,8 +300,6 @@ def _build_efficiency(artifact: ArtifactData) -> Optional[Dict]:
         "compute_ms": round(compute_ms, 1),
         "data_loading_pct": round(dl_pct, 1),
         "data_loading_ms": round(dl_ms, 1),
-        "communication_pct": 0.0,
-        "communication_ms": 0.0,
         "other_pct": round(other_pct, 1),
         "other_ms": round(other_ms, 1),
         "bottleneck": bottleneck,
@@ -373,12 +366,13 @@ def _deduplicate(diags: List[Diagnosis]) -> List[Diagnosis]:
         key = (d.file_path, d.line_number)
         file_line_rules.setdefault(key, []).append(d.rule_id)
 
-    has_prec_rule = any(d.rule_id.startswith("PREC") for d in diags)
+    # Build set of files that have precision rules
+    prec_files = {d.file_path for d in diags if d.rule_id.startswith("PREC")}
 
     result = []
     for d in diags:
-        # Suppress MEM002 if any precision rule fires
-        if d.rule_id == "MEM002" and has_prec_rule:
+        # Suppress MEM002 only if a precision rule fires in the SAME file
+        if d.rule_id == "MEM002" and d.file_path in prec_files:
             continue
 
         # DL001 + DL005 on same line: skip DL001

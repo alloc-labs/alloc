@@ -141,6 +141,9 @@ def _try_import_pynvml():
 class _NvmlMonitor:
     """Background NVML sampling thread for callbacks.
 
+    Monitors ALL visible GPUs (respects CUDA_VISIBLE_DEVICES via NVML).
+    Produces per-GPU peak VRAM for straggler detection.
+    Thread-safe: uses a lock for _samples access.
     Gracefully no-ops if pynvml is not installed or NVML init fails.
     """
 
@@ -149,9 +152,15 @@ class _NvmlMonitor:
         self._pynvml = _try_import_pynvml()
         self._thread = None  # type: Optional[threading.Thread]
         self._stop_event = threading.Event()
+        self._lock = threading.Lock()
         self._samples = []  # type: List[Dict[str, Any]]
         self._hw_context = {}  # type: Dict[str, Any]
         self._start_time = 0.0
+        self._stop_time = None  # type: Optional[float]
+        self._gpu_count = 0  # actual GPUs being monitored
+        self._gpu_handles = []  # type: List[Any]
+        self._per_gpu_peak_vram_mb = []  # type: List[float]
+        self._stopped = False  # type: bool
 
     @property
     def available(self):
@@ -163,6 +172,8 @@ class _NvmlMonitor:
         """Init NVML, capture hardware context, spawn sampling daemon."""
         if self._pynvml is None:
             return
+        if self._stopped:
+            return  # already ran and stopped — no restart
         try:
             self._pynvml.nvmlInit()
         except Exception:
@@ -171,16 +182,34 @@ class _NvmlMonitor:
 
         self._start_time = time.time()
 
+        # Discover all GPUs
+        try:
+            self._gpu_count = self._pynvml.nvmlDeviceGetCount()
+        except Exception:
+            self._gpu_count = 1
+
+        # Get handles for all GPUs
+        self._gpu_handles = []
+        for i in range(self._gpu_count):
+            try:
+                handle = self._pynvml.nvmlDeviceGetHandleByIndex(i)
+                self._gpu_handles.append(handle)
+            except Exception:
+                pass
+
+        if not self._gpu_handles:
+            return
+
+        self._per_gpu_peak_vram_mb = [0.0] * len(self._gpu_handles)
+
         # Capture hardware context from GPU 0
         try:
-            handle = self._pynvml.nvmlDeviceGetHandleByIndex(0)
-
+            handle = self._gpu_handles[0]
             name = self._pynvml.nvmlDeviceGetName(handle)
             if isinstance(name, bytes):
                 name = name.decode("utf-8")
             mem_info = self._pynvml.nvmlDeviceGetMemoryInfo(handle)
             total_mb = round(mem_info.total / (1024 * 1024), 1)
-
             self._hw_context["gpu_name"] = name
             self._hw_context["gpu_total_vram_mb"] = total_mb
         except Exception:
@@ -203,41 +232,79 @@ class _NvmlMonitor:
             pass
 
         try:
-            handle = self._pynvml.nvmlDeviceGetHandleByIndex(0)
+            handle = self._gpu_handles[0]
             sm_major, sm_minor = self._pynvml.nvmlDeviceGetCudaComputeCapability(handle)
             self._hw_context["sm_version"] = "{}.{}".format(sm_major, sm_minor)
         except Exception:
             pass
 
+        self._hw_context["num_gpus_detected"] = self._gpu_count
+
+        # Detect NVLink interconnect
         try:
-            self._hw_context["num_gpus_detected"] = self._pynvml.nvmlDeviceGetCount()
+            handle = self._gpu_handles[0]
+            has_nvlink = False
+            for link in range(18):  # max NVLink connections
+                try:
+                    state = self._pynvml.nvmlDeviceGetNvLinkState(handle, link)
+                    if state:
+                        has_nvlink = True
+                        break
+                except Exception:
+                    break
+            self._hw_context["interconnect_type"] = "nvlink" if has_nvlink else "pcie"
         except Exception:
-            self._hw_context["num_gpus_detected"] = 1
+            pass
 
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
 
     def _sample_loop(self):
         # type: () -> None
-        """Poll GPU metrics until stop event is set."""
+        """Poll GPU metrics for ALL GPUs until stop event is set."""
         pynvml = self._pynvml
-        if pynvml is None:
+        if pynvml is None or not self._gpu_handles:
             return
         try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             while not self._stop_event.is_set():
-                try:
-                    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
-                    self._samples.append({
-                        "t": round(time.time() - self._start_time, 2),
-                        "vram_mb": round(mem.used / (1024 * 1024), 1),
-                        "gpu_util_pct": round(float(util.gpu), 1),
-                        "power_w": round(power, 1),
-                    })
-                except Exception:
-                    pass
+                t = round(time.time() - self._start_time, 2)
+                total_vram = 0.0
+                total_util = 0.0
+                total_power = 0.0
+                gpu_count = len(self._gpu_handles)
+
+                for idx, handle in enumerate(self._gpu_handles):
+                    try:
+                        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        vram_mb = round(mem.used / (1024 * 1024), 1)
+                        total_vram += vram_mb
+                        # Track per-GPU peak
+                        if vram_mb > self._per_gpu_peak_vram_mb[idx]:
+                            self._per_gpu_peak_vram_mb[idx] = vram_mb
+                    except Exception:
+                        vram_mb = 0.0
+
+                    try:
+                        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                        total_util += float(util.gpu)
+                    except Exception:
+                        pass
+
+                    try:
+                        power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                        total_power += power
+                    except Exception:
+                        pass
+
+                sample = {
+                    "t": t,
+                    "vram_mb": round(total_vram / gpu_count, 1) if gpu_count else 0.0,
+                    "gpu_util_pct": round(total_util / gpu_count, 1) if gpu_count else 0.0,
+                    "power_w": round(total_power / gpu_count, 1) if gpu_count else 0.0,
+                }
+                with self._lock:
+                    self._samples.append(sample)
+
                 self._stop_event.wait(_NVML_POLL_INTERVAL_S)
         except Exception:
             pass
@@ -245,6 +312,10 @@ class _NvmlMonitor:
     def stop(self):
         # type: () -> None
         """Stop sampling thread and shutdown NVML."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._stop_time = time.time()
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -261,22 +332,30 @@ class _NvmlMonitor:
 
         If NVML was unavailable, returns ({}, {}).
         """
-        if not self._hw_context and not self._samples:
+        with self._lock:
+            samples_copy = list(self._samples)
+
+        if not self._hw_context and not samples_copy:
             return {}, {}
 
-        duration = round(time.time() - self._start_time, 2) if self._start_time else 0.0
+        if self._stop_time and self._start_time:
+            duration = round(self._stop_time - self._start_time, 2)
+        elif self._start_time:
+            duration = round(time.time() - self._start_time, 2)
+        else:
+            duration = 0.0
 
         peak_vram = 0.0
         total_util = 0.0
         total_power = 0.0
-        for s in self._samples:
+        for s in samples_copy:
             vram = s.get("vram_mb", 0.0)
             if vram > peak_vram:
                 peak_vram = vram
             total_util += s.get("gpu_util_pct", 0.0)
             total_power += s.get("power_w", 0.0)
 
-        n = len(self._samples)
+        n = len(samples_copy)
         avg_util = round(total_util / n, 1) if n else 0.0
         avg_power = round(total_power / n, 1) if n else 0.0
 
@@ -285,12 +364,22 @@ class _NvmlMonitor:
             "avg_gpu_util": avg_util,
             "avg_power_watts": avg_power,
             "duration_seconds": duration,
-            "samples": list(self._samples),
+            "samples": samples_copy,
             "gpu_name": self._hw_context.get("gpu_name"),
             "gpu_total_vram_mb": self._hw_context.get("gpu_total_vram_mb"),
             "num_gpus_detected": self._hw_context.get("num_gpus_detected", 1),
             "probe_mode": "callback",
         }
+
+        # Per-GPU peak VRAM — critical for straggler detection
+        if self._per_gpu_peak_vram_mb and any(v > 0 for v in self._per_gpu_peak_vram_mb):
+            probe_dict["per_rank_peak_vram_mb"] = [
+                round(v, 1) for v in self._per_gpu_peak_vram_mb
+            ]
+
+        # Interconnect type if detected
+        if self._hw_context.get("interconnect_type"):
+            probe_dict["interconnect_type"] = self._hw_context["interconnect_type"]
 
         hw_context = dict(self._hw_context)
         return hw_context, probe_dict
@@ -308,19 +397,22 @@ def _write_full_artifact(monitor, sidecar_data):
     try:
         hw_context, probe_dict = monitor.get_results()
 
-        # Merge step timing from sidecar into probe_dict
-        if probe_dict:
-            for key in ("step_time_ms_p50", "step_time_ms_p90", "step_time_ms_mean",
-                        "step_time_ms_std", "samples_per_sec", "step_count", "batch_size",
-                        "framework"):
-                val = sidecar_data.get(key)
-                if val is not None:
-                    probe_dict[key] = val
+        # Use probe_dict if it has data, otherwise create from sidecar timing
+        if probe_dict is None:
+            probe_dict = {}
 
-            if sidecar_data.get("is_distributed"):
-                probe_dict["is_distributed"] = True
-                probe_dict["rank"] = sidecar_data.get("rank", 0)
-                probe_dict["world_size"] = sidecar_data.get("world_size", 1)
+        # Always merge step timing from sidecar into probe_dict
+        for key in ("step_time_ms_p50", "step_time_ms_p90", "step_time_ms_mean",
+                    "step_time_ms_std", "samples_per_sec", "step_count", "batch_size",
+                    "framework"):
+            val = sidecar_data.get(key)
+            if val is not None:
+                probe_dict[key] = val
+
+        if sidecar_data.get("is_distributed"):
+            probe_dict["is_distributed"] = True
+            probe_dict["rank"] = sidecar_data.get("rank", 0)
+            probe_dict["world_size"] = sidecar_data.get("world_size", 1)
 
         from alloc.artifact_writer import write_report
         write_report(

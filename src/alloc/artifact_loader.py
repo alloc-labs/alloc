@@ -95,7 +95,8 @@ def _parse_artifact(raw: dict) -> ArtifactData:
 
     # Hardware
     data.gpu_name = hardware.get("gpu_name") or probe.get("gpu_name")
-    data.gpu_count = hardware.get("num_gpus_detected") or 1
+    gpu_count = hardware.get("num_gpus_detected")
+    data.gpu_count = gpu_count if gpu_count is not None and gpu_count > 0 else 1
     data.per_gpu_vram_total_mb = _float_or_none(
         hardware.get("gpu_total_vram_mb") or probe.get("gpu_total_vram_mb")
     )
