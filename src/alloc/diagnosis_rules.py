@@ -537,6 +537,9 @@ def rule_prec002_fp16_on_ampere(
             suggested_code = suggested_code.replace(".half()", ".bfloat16()")
         elif "float16" in suggested_code:
             suggested_code = suggested_code.replace("float16", "bfloat16")
+        elif prec.kind == "autocast" and "dtype=" not in suggested_code:
+            # autocast without explicit dtype defaults to fp16 — add bf16
+            suggested_code = suggested_code.replace("autocast(", "autocast(dtype=torch.bfloat16, ", 1)
 
         gpu_name = hw.get("gpu_name", "GPU")
 

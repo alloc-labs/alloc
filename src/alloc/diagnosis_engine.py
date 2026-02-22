@@ -69,7 +69,7 @@ def run_diagnosis(
                 diags = rule_fn(findings, hardware_context)
             all_diags.extend(diags)
         except Exception:
-            logger.debug("Rule %s raised an exception", rule_name, exc_info=True)
+            logger.debug("Rule %s raised an exception", rule_fn.__name__, exc_info=True)
             continue
 
     # Deduplicate overlapping rules
@@ -196,7 +196,7 @@ def _build_comparison(current: ArtifactData, previous: ArtifactData) -> Dict:
     _add("GPU utilization", current.avg_gpu_util, previous.avg_gpu_util, "%", higher_is_worse=False)
 
     # Throughput (lower is worse)
-    _add("Throughput", current.throughput_samples_per_sec, previous.throughput_samples_per_sec, "s/s", higher_is_worse=False)
+    _add("Throughput", current.throughput_samples_per_sec, previous.throughput_samples_per_sec, "samples/s", higher_is_worse=False)
 
     return {
         "metrics": metrics,

@@ -1,5 +1,6 @@
 {
   "version": "1",
+  "_note": "All TFLOPS values are dense Tensor Core (no structured sparsity). bandwidth_gbps is HBM bandwidth in GB/s.",
   "gpus": {
     "nvidia-h200-141gb": {
       "display_name": "H200",
@@ -38,7 +39,7 @@
       "tf32_tflops": 495,
       "architecture": "Hopper",
       "tdp_watts": 400,
-      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 900, "pcie_gen": 5 }
+      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 600, "pcie_gen": 5 }
     },
     "nvidia-a100-sxm-80gb": {
       "display_name": "A100-80GB",
@@ -71,10 +72,10 @@
       "vendor": "nvidia",
       "vram_gb": 24,
       "bandwidth_gbps": 600,
-      "fp16_tflops": 125,
-      "bf16_tflops": 125,
+      "fp16_tflops": 62.5,
+      "bf16_tflops": 62.5,
       "fp32_tflops": 31.2,
-      "tf32_tflops": 62.5,
+      "tf32_tflops": 31.2,
       "architecture": "Ampere",
       "tdp_watts": 300,
       "interconnect": { "pcie_gen": 4 }
@@ -84,10 +85,10 @@
       "vendor": "nvidia",
       "vram_gb": 48,
       "bandwidth_gbps": 864,
-      "fp16_tflops": 362,
-      "bf16_tflops": 362,
+      "fp16_tflops": 181,
+      "bf16_tflops": 181,
       "fp32_tflops": 91.6,
-      "tf32_tflops": 183,
+      "tf32_tflops": 91.6,
       "architecture": "Ada Lovelace",
       "tdp_watts": 350,
       "interconnect": { "pcie_gen": 4 }
@@ -97,10 +98,10 @@
       "vendor": "nvidia",
       "vram_gb": 24,
       "bandwidth_gbps": 300,
-      "fp16_tflops": 121,
-      "bf16_tflops": 121,
+      "fp16_tflops": 60.5,
+      "bf16_tflops": 60.5,
       "fp32_tflops": 30.3,
-      "tf32_tflops": 60,
+      "tf32_tflops": 30.3,
       "architecture": "Ada Lovelace",
       "tdp_watts": 72,
       "interconnect": { "pcie_gen": 4 }
@@ -149,10 +150,10 @@
       "vendor": "nvidia",
       "vram_gb": 24,
       "bandwidth_gbps": 1008,
-      "fp16_tflops": 330,
-      "bf16_tflops": 330,
+      "fp16_tflops": 165.2,
+      "bf16_tflops": 165.2,
       "fp32_tflops": 82.6,
-      "tf32_tflops": 165,
+      "tf32_tflops": 82.6,
       "architecture": "Ada Lovelace",
       "tdp_watts": 450,
       "interconnect": { "pcie_gen": 4 }
@@ -162,10 +163,10 @@
       "vendor": "nvidia",
       "vram_gb": 24,
       "bandwidth_gbps": 936,
-      "fp16_tflops": 142,
-      "bf16_tflops": 142,
+      "fp16_tflops": 71,
+      "bf16_tflops": 71,
       "fp32_tflops": 35.6,
-      "tf32_tflops": 71,
+      "tf32_tflops": 35.6,
       "architecture": "Ampere",
       "tdp_watts": 350,
       "interconnect": { "pcie_gen": 4 }

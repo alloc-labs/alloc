@@ -469,11 +469,21 @@ try:
 
             if self._batch_size is None:
                 try:
-                    if hasattr(batch, "__len__"):
-                        self._batch_size = len(batch)
-                    elif hasattr(batch, "shape"):
+                    # batch can be a tensor, dict, list, or tuple
+                    if hasattr(batch, "shape"):
+                        # Tensor — first dim is batch size
                         self._batch_size = batch.shape[0]
-                    elif hasattr(trainer, "datamodule") and trainer.datamodule is not None:
+                    elif isinstance(batch, dict):
+                        # Dict of tensors — get batch size from first value
+                        first_val = next(iter(batch.values()), None)
+                        if first_val is not None and hasattr(first_val, "shape"):
+                            self._batch_size = first_val.shape[0]
+                    elif isinstance(batch, (list, tuple)) and len(batch) > 0:
+                        # List/tuple of tensors — get batch size from first element
+                        first_elem = batch[0]
+                        if hasattr(first_elem, "shape"):
+                            self._batch_size = first_elem.shape[0]
+                    if self._batch_size is None and hasattr(trainer, "datamodule") and trainer.datamodule is not None:
                         dm = trainer.datamodule
                         if hasattr(dm, "batch_size"):
                             self._batch_size = dm.batch_size

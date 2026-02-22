@@ -198,7 +198,7 @@ def _build_patches(result: DiagnoseResult) -> List[str]:
 
         for diag in diags:
             line = diag.line_number
-            rel_path = os.path.basename(file_path)
+            rel_path = file_path
 
             patch_lines = [
                 f"--- a/{rel_path}",
