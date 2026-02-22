@@ -4,6 +4,7 @@ Commands:
     alloc ghost <script.py>    Ghost scan — static VRAM analysis without executing the model
     alloc run <command...>     Wrap training with probe monitoring, write artifact
     alloc scan --model <name>  Remote ghost scan via API — no GPU needed
+    alloc diagnose <script.py> Analyze training script for performance issues
     alloc login                Authenticate with Alloc dashboard
     alloc upload <artifact>    Upload an artifact to the Alloc dashboard
     alloc version              Show version
@@ -261,6 +262,86 @@ def run(
 
     if result.exit_code and result.exit_code != 0:
         raise typer.Exit(result.exit_code)
+
+
+@app.command()
+def diagnose(
+    script: str = typer.Argument(..., help="Python script to analyze (e.g. train.py)"),
+    diff: bool = typer.Option(False, "--diff", help="Output unified diff patches"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show rule details and references"),
+    no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml"),
+    severity: Optional[str] = typer.Option(None, "--severity", help="Filter: critical, warning, info"),
+    category: Optional[str] = typer.Option(None, "--category", help="Filter: dataloader, memory, precision, distributed, throughput"),
+):
+    """Analyze a training script for performance issues."""
+    from alloc.code_analyzer import analyze_script as _analyze_script
+    from alloc.diagnosis_engine import run_diagnosis, _quick_hw_context
+    from alloc.diagnosis_display import print_diagnose_rich, print_diagnose_diff, print_diagnose_json
+
+    if not os.path.isfile(script):
+        if json_output:
+            _print_json({"error": f"File not found: {script}"})
+        else:
+            console.print(f"[red]File not found: {script}[/red]")
+        raise typer.Exit(1)
+
+    if not script.endswith(".py"):
+        if json_output:
+            _print_json({"error": f"Expected a Python file: {script}"})
+        else:
+            console.print(f"[yellow]Expected a Python file: {script}[/yellow]")
+        raise typer.Exit(1)
+
+    # Analyze the script
+    findings = _analyze_script(script)
+
+    # Build hardware context
+    hw = _quick_hw_context()
+
+    # Merge .alloc.yaml GPU context if available
+    if not no_config:
+        gpu_context = _load_gpu_context(False)
+        if gpu_context and hw is None:
+            # Use config hints if no live hardware
+            ic = gpu_context.get("interconnect")
+            fleet = gpu_context.get("fleet", [])
+            if fleet:
+                hw = {"gpu_count": len(fleet)}
+        elif gpu_context and hw is not None:
+            # Supplement live hardware with config
+            fleet = gpu_context.get("fleet", [])
+            if fleet and hw.get("gpu_count", 1) <= 1:
+                pass  # Don't override live detection
+
+    result = run_diagnosis(findings, hardware_context=hw)
+
+    # Apply filters
+    if severity:
+        sev = severity.strip().lower()
+        result.findings = [d for d in result.findings if d.severity == sev]
+        result.summary = _recount_summary(result.findings)
+    if category:
+        cat = category.strip().lower()
+        result.findings = [d for d in result.findings if d.category == cat]
+        result.summary = _recount_summary(result.findings)
+
+    # Output
+    if json_output:
+        print_diagnose_json(result)
+    elif diff:
+        print_diagnose_diff(result)
+    else:
+        print_diagnose_rich(result, verbose=verbose)
+
+
+def _recount_summary(findings):
+    """Recount summary after filtering."""
+    summary = {"critical": 0, "warning": 0, "info": 0, "total": len(findings)}
+    for d in findings:
+        if d.severity in summary:
+            summary[d.severity] += 1
+    return summary
 
 
 @app.command()
