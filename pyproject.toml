@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alloc"
-version = "0.0.2"
+version = "0.0.3"
 description = "Engineer-first training calibration: estimate VRAM fit, profile short runs, and pick GPU configs under real budget constraints."
 readme = "README.md"
 license = "Apache-2.0"

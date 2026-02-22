@@ -148,7 +148,8 @@ def run(
         console.print(f"[green]alloc[/green] [dim]v{__version__}[/dim] — {mode_label}")
         console.print(f"[dim]Command: {' '.join(command)}[/dim]")
         if calibrate:
-            console.print(f"[dim]Auto-stop when metrics stabilize (timeout: {timeout}s)[/dim]")
+            console.print(f"[yellow]Calibrate mode: training will be stopped once metrics stabilize (timeout: {timeout}s)[/yellow]")
+            console.print(f"[dim]Use --full to monitor without stopping the training process[/dim]")
         console.print()
 
     result = probe_command(
@@ -251,14 +252,17 @@ def run(
         elif artifact_path:
             console.print(f"[dim]Artifact saved: {artifact_path}[/dim]")
 
-    # Auto-upload when logged in, --upload flag, or ALLOC_UPLOAD env var
-    # --no-upload overrides everything
-    should_auto = not no_upload and (upload or should_upload() or bool(get_token()))
-    if artifact_path and should_auto:
+    # Upload when explicitly opted in: --upload flag or ALLOC_UPLOAD env var
+    # Being logged in alone does NOT trigger upload (privacy-first)
+    should_upload_artifact = not no_upload and (upload or should_upload())
+    if artifact_path and should_upload_artifact:
         _try_upload(artifact_path)
-    elif artifact_path and not should_auto and not no_upload and not get_token():
+    elif artifact_path and not should_upload_artifact and not no_upload:
         if not json_output:
-            console.print("[dim]Tip: alloc login --browser to auto-upload runs to your dashboard[/dim]")
+            if get_token():
+                console.print("[dim]Tip: alloc run --upload to send this artifact to your dashboard[/dim]")
+            else:
+                console.print("[dim]Tip: alloc login --browser to connect your dashboard[/dim]")
 
     if result.exit_code and result.exit_code != 0:
         raise typer.Exit(result.exit_code)
@@ -266,18 +270,43 @@ def run(
 
 @app.command()
 def diagnose(
-    script: str = typer.Argument(..., help="Python script to analyze (e.g. train.py)"),
+    script: str = typer.Argument("", help="Python script to analyze (e.g. train.py)"),
     diff: bool = typer.Option(False, "--diff", help="Output unified diff patches"),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show rule details and references"),
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml"),
     severity: Optional[str] = typer.Option(None, "--severity", help="Filter: critical, warning, info"),
     category: Optional[str] = typer.Option(None, "--category", help="Filter: dataloader, memory, precision, distributed, throughput"),
+    # Phase 2 flags
+    artifact: Optional[str] = typer.Option(None, "--artifact", help="Path to alloc_artifact.json.gz"),
+    no_artifact: bool = typer.Option(False, "--no-artifact", help="Skip artifact auto-discovery (AST-only)"),
+    memory: bool = typer.Option(False, "--memory", help="Show VRAM breakdown"),
+    efficiency: bool = typer.Option(False, "--efficiency", help="Show step time decomposition"),
+    compare: Optional[str] = typer.Option(None, "--compare", help="Compare with another artifact"),
+    rules: bool = typer.Option(False, "--rules", help="List all available diagnosis rules"),
 ):
     """Analyze a training script for performance issues."""
+    if rules:
+        _print_rules(json_output)
+        raise typer.Exit(0)
+
+    if not script:
+        if json_output:
+            _print_json({"error": "No script specified. Usage: alloc diagnose train.py"})
+        else:
+            console.print("[red]No script specified.[/red]")
+            console.print("[dim]Usage: alloc diagnose train.py[/dim]")
+            console.print("[dim]       alloc diagnose --rules[/dim]")
+        raise typer.Exit(1)
+
     from alloc.code_analyzer import analyze_script as _analyze_script
+    from alloc.artifact_loader import load_artifact as _load_artifact, find_artifact as _find_artifact
     from alloc.diagnosis_engine import run_diagnosis, _quick_hw_context
-    from alloc.diagnosis_display import print_diagnose_rich, print_diagnose_diff, print_diagnose_json
+    from alloc.diagnosis_display import (
+        print_diagnose_rich, print_diagnose_diff, print_diagnose_json,
+        print_diagnose_memory, print_diagnose_efficiency,
+        print_diagnose_comparison, print_oom_autopsy,
+    )
 
     if not os.path.isfile(script):
         if json_output:
@@ -296,6 +325,27 @@ def diagnose(
     # Analyze the script
     findings = _analyze_script(script)
 
+    # Resolve artifact (Phase 2)
+    artifact_data = None
+    artifact_path = None
+    if not no_artifact:
+        if artifact:
+            artifact_path = artifact
+        else:
+            artifact_path = _find_artifact(".")
+
+        if artifact_path:
+            artifact_data = _load_artifact(artifact_path)
+            if artifact_data is None and not json_output:
+                console.print(f"[yellow]Could not parse artifact: {artifact_path}[/yellow]")
+
+    # Load comparison artifact
+    compare_data = None
+    if compare:
+        compare_data = _load_artifact(compare)
+        if compare_data is None and not json_output:
+            console.print(f"[yellow]Could not parse comparison artifact: {compare}[/yellow]")
+
     # Build hardware context
     hw = _quick_hw_context()
 
@@ -303,18 +353,22 @@ def diagnose(
     if not no_config:
         gpu_context = _load_gpu_context(False)
         if gpu_context and hw is None:
-            # Use config hints if no live hardware
-            ic = gpu_context.get("interconnect")
             fleet = gpu_context.get("fleet", [])
             if fleet:
                 hw = {"gpu_count": len(fleet)}
         elif gpu_context and hw is not None:
-            # Supplement live hardware with config
-            fleet = gpu_context.get("fleet", [])
-            if fleet and hw.get("gpu_count", 1) <= 1:
-                pass  # Don't override live detection
+            pass  # Don't override live detection
 
-    result = run_diagnosis(findings, hardware_context=hw)
+    result = run_diagnosis(
+        findings,
+        hardware_context=hw,
+        artifact=artifact_data,
+        compare_artifact=compare_data,
+    )
+
+    # Set artifact_path on result
+    if artifact_path:
+        result.artifact_path = artifact_path
 
     # Apply filters
     if severity:
@@ -326,9 +380,20 @@ def diagnose(
         result.findings = [d for d in result.findings if d.category == cat]
         result.summary = _recount_summary(result.findings)
 
-    # Output
+    # Output routing
     if json_output:
         print_diagnose_json(result)
+    elif memory:
+        print_diagnose_memory(result)
+    elif efficiency:
+        print_diagnose_efficiency(result)
+    elif compare_data and result.comparison:
+        print_diagnose_comparison(result)
+    elif result.oom_detected:
+        print_oom_autopsy(result)
+        # Also show regular findings
+        if result.findings:
+            print_diagnose_rich(result, verbose=verbose)
     elif diff:
         print_diagnose_diff(result)
     else:
@@ -342,6 +407,86 @@ def _recount_summary(findings):
         if d.severity in summary:
             summary[d.severity] += 1
     return summary
+
+
+def _print_rules(json_output: bool) -> None:
+    """List all available diagnosis rules."""
+    import inspect
+    from alloc.diagnosis_rules import ALL_RULES
+
+    _category_map = {
+        "dl": "dataloader",
+        "mem": "memory",
+        "prec": "precision",
+        "dist": "distributed",
+        "thru": "throughput",
+        "xs": "cross-signal",
+        "strag": "straggler",
+        "reg": "regression",
+    }
+
+    rules_info = []
+    for fn in ALL_RULES:
+        name = fn.__name__  # e.g. "rule_dl001_num_workers_low"
+        parts = name.replace("rule_", "", 1).split("_", 1)
+        rule_id = parts[0].upper() if parts else name  # "DL001"
+
+        title = ""
+        doc = inspect.getdoc(fn)
+        if doc:
+            title = doc.split("\n")[0].rstrip(".")
+
+        # Category from ID prefix
+        prefix = ""
+        for ch in rule_id:
+            if ch.isalpha():
+                prefix += ch.lower()
+            else:
+                break
+        category = _category_map.get(prefix, prefix)
+
+        # Data tier from argument count
+        sig = inspect.signature(fn)
+        nparams = len(sig.parameters)
+        if nparams >= 4:
+            tier = "regression"
+        elif nparams >= 3:
+            tier = "runtime"
+        else:
+            tier = "ast-only"
+
+        rules_info.append({
+            "id": rule_id,
+            "title": title,
+            "category": category,
+            "tier": tier,
+        })
+
+    if json_output:
+        _print_json({"rules": rules_info, "total": len(rules_info)})
+    else:
+        from rich.table import Table
+
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=None,
+            padding=(0, 2),
+        )
+        table.add_column("Rule", style="bold", no_wrap=True)
+        table.add_column("Category", style="dim")
+        table.add_column("Tier", style="dim")
+        table.add_column("Description")
+
+        for r in rules_info:
+            table.add_row(r["id"], r["category"], r["tier"], r["title"])
+
+        console.print()
+        console.print(f"[green]alloc diagnose[/green] — {len(rules_info)} rules")
+        console.print()
+        console.print(table)
+        console.print()
+        console.print("[dim]Tiers: ast-only (no GPU needed), runtime (requires alloc_artifact), regression (requires --compare)[/dim]")
 
 
 @app.command()

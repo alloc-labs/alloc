@@ -81,20 +81,6 @@ def _try_import_pynvml():
         return None
 
 
-def _check_stable(samples, window=20, variance_threshold=5.0):
-    """Check if GPU metrics have stabilized over the last `window` samples.
-
-    Stability = std dev of GPU util over last `window` samples < threshold.
-    """
-    if len(samples) < window:
-        return False
-
-    recent = samples[-window:]
-    utils = [s.gpu_util_pct for s in recent]
-    mean = sum(utils) / len(utils)
-    variance = sum((u - mean) ** 2 for u in utils) / len(utils)
-    return variance ** 0.5 < variance_threshold
-
 
 def _get_child_pids(pid):
     # type: (int) -> List[int]
@@ -366,8 +352,9 @@ def probe_command(
         if proc.poll() is not None and stop_reason_ref[0] is None:
             stop_reason_ref[0] = StopReason.PROCESS_EXIT.value
 
-        # Gracefully terminate the process if still running
+        # Gracefully terminate the process if still running (calibrate mode only)
         if proc.poll() is None:
+            print("\nalloc: Calibration complete — stopping training process (SIGTERM).", file=sys.stderr, flush=True)
             proc.send_signal(signal.SIGTERM)
             try:
                 proc.wait(timeout=15)

@@ -163,6 +163,7 @@ def print_verdict(result, artifact_path="", step_count=None, callback_data=None,
 
         if artifact_path:
             console.print(f"  [dim]Artifact: {artifact_path}[/dim]")
+        console.print(f"  [dim]Tip: Run `alloc diagnose <script.py>` for code-level suggestions[/dim]")
         console.print()
 
     except ImportError:

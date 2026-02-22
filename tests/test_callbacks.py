@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -14,6 +16,8 @@ from alloc.callbacks import (
     _detect_distributed,
     _build_sidecar,
     _write_callback_data,
+    _NvmlMonitor,
+    _write_full_artifact,
 )
 
 
@@ -241,3 +245,339 @@ class TestBuildSidecarDistributed:
         assert data["is_distributed"] is True
         assert data["rank"] == 2
         assert data["world_size"] == 8
+
+
+# ── NVML Monitor ────────────────────────────────────────────────────────
+
+
+class TestNvmlMonitorNoPynvml:
+    def test_no_pynvml_returns_empty(self):
+        """Without pynvml, get_results returns empty dicts."""
+        with patch("alloc.callbacks._try_import_pynvml", return_value=None):
+            monitor = _NvmlMonitor()
+        monitor.start()  # should be no-op
+        monitor.stop()
+        hw, probe = monitor.get_results()
+        assert hw == {}
+        assert probe == {}
+
+    def test_available_false_without_pynvml(self):
+        """Monitor reports not available without pynvml."""
+        with patch("alloc.callbacks._try_import_pynvml", return_value=None):
+            monitor = _NvmlMonitor()
+        assert monitor.available is False
+
+
+class TestNvmlMonitorWithMock:
+    def _make_mock_pynvml(self):
+        """Build a mock pynvml module with standard GPU 0 responses."""
+        mock_pynvml = MagicMock()
+        mock_pynvml.nvmlInit.return_value = None
+        mock_pynvml.nvmlShutdown.return_value = None
+        mock_pynvml.nvmlDeviceGetCount.return_value = 2
+
+        # GPU name
+        mock_pynvml.nvmlDeviceGetName.return_value = "NVIDIA A100-SXM4-80GB"
+
+        # Memory info
+        mem_info = SimpleNamespace(total=80 * 1024 * 1024 * 1024, used=40 * 1024 * 1024 * 1024)
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem_info
+
+        # Driver / CUDA
+        mock_pynvml.nvmlSystemGetDriverVersion.return_value = "535.129.03"
+        mock_pynvml.nvmlSystemGetCudaDriverVersion.return_value = 12020  # 12.2
+        mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (8, 0)
+
+        # Utilization
+        util = SimpleNamespace(gpu=75.0, memory=60.0)
+        mock_pynvml.nvmlDeviceGetUtilizationRates.return_value = util
+
+        # Power (in milliwatts)
+        mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 300000  # 300W
+
+        return mock_pynvml
+
+    def test_hw_context_keys(self):
+        """Mock pynvml, verify hardware context has all expected keys."""
+        mock_pynvml = self._make_mock_pynvml()
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            monitor = _NvmlMonitor()
+        monitor.start()
+        # Let the sampling thread run briefly
+        import time
+        time.sleep(0.05)
+        monitor.stop()
+
+        hw, probe = monitor.get_results()
+        assert hw["gpu_name"] == "NVIDIA A100-SXM4-80GB"
+        assert hw["gpu_total_vram_mb"] == round(80 * 1024, 1)
+        assert hw["driver_version"] == "535.129.03"
+        assert hw["cuda_version"] == "12.2"
+        assert hw["sm_version"] == "8.0"
+        assert hw["num_gpus_detected"] == 2
+
+    def test_probe_dict_keys(self):
+        """Verify probe_dict has all expected keys including probe_mode."""
+        mock_pynvml = self._make_mock_pynvml()
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            monitor = _NvmlMonitor()
+        monitor.start()
+        import time
+        time.sleep(0.05)
+        monitor.stop()
+
+        _, probe = monitor.get_results()
+        assert probe["probe_mode"] == "callback"
+        assert "peak_vram_mb" in probe
+        assert "avg_gpu_util" in probe
+        assert "avg_power_watts" in probe
+        assert "duration_seconds" in probe
+        assert "samples" in probe
+        assert isinstance(probe["samples"], list)
+
+    def test_samples_have_correct_fields(self):
+        """Verify each sample has t, vram_mb, gpu_util_pct, power_w."""
+        mock_pynvml = self._make_mock_pynvml()
+        # Use very short poll interval to get samples quickly
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            with patch("alloc.callbacks._NVML_POLL_INTERVAL_S", 0.01):
+                monitor = _NvmlMonitor()
+                monitor.start()
+                import time
+                time.sleep(0.05)
+                monitor.stop()
+
+        _, probe = monitor.get_results()
+        assert len(probe["samples"]) > 0
+        sample = probe["samples"][0]
+        assert "t" in sample
+        assert "vram_mb" in sample
+        assert "gpu_util_pct" in sample
+        assert "power_w" in sample
+
+
+class TestNvmlMonitorCleanup:
+    def test_stop_calls_nvml_shutdown(self):
+        """nvmlShutdown is called on stop."""
+        mock_pynvml = MagicMock()
+        mock_pynvml.nvmlInit.return_value = None
+        mock_pynvml.nvmlDeviceGetName.return_value = "GPU"
+        mem = SimpleNamespace(total=80 * 1024**3, used=10 * 1024**3)
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem
+        mock_pynvml.nvmlSystemGetDriverVersion.return_value = "535"
+        mock_pynvml.nvmlSystemGetCudaDriverVersion.return_value = 12000
+        mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (8, 0)
+        mock_pynvml.nvmlDeviceGetCount.return_value = 1
+        util = SimpleNamespace(gpu=50, memory=30)
+        mock_pynvml.nvmlDeviceGetUtilizationRates.return_value = util
+        mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 200000
+
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            monitor = _NvmlMonitor()
+        monitor.start()
+        monitor.stop()
+        mock_pynvml.nvmlShutdown.assert_called_once()
+
+    def test_nvml_init_failure_graceful(self):
+        """If nvmlInit raises, monitor degrades gracefully."""
+        mock_pynvml = MagicMock()
+        mock_pynvml.nvmlInit.side_effect = Exception("No NVIDIA driver")
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            monitor = _NvmlMonitor()
+        monitor.start()  # should handle exception
+        monitor.stop()
+        hw, probe = monitor.get_results()
+        assert hw == {}
+        assert probe == {}
+
+
+# ── Artifact writing ────────────────────────────────────────────────────
+
+
+class TestWriteFullArtifact:
+    def test_writes_artifact_file(self, tmp_path, monkeypatch):
+        """_write_full_artifact creates alloc_artifact.json.gz with merged data."""
+        monkeypatch.chdir(tmp_path)
+
+        monitor = MagicMock()
+        monitor.get_results.return_value = (
+            {"gpu_name": "A100", "gpu_total_vram_mb": 81920.0, "num_gpus_detected": 1},
+            {
+                "peak_vram_mb": 40000.0,
+                "avg_gpu_util": 75.0,
+                "avg_power_watts": 300.0,
+                "duration_seconds": 120.0,
+                "samples": [{"t": 0, "vram_mb": 40000.0, "gpu_util_pct": 75.0, "power_w": 300.0}],
+                "gpu_name": "A100",
+                "gpu_total_vram_mb": 81920.0,
+                "num_gpus_detected": 1,
+                "probe_mode": "callback",
+            },
+        )
+
+        sidecar = {
+            "framework": "huggingface",
+            "step_count": 100,
+            "step_time_ms_p50": 50.0,
+            "step_time_ms_p90": 80.0,
+            "samples_per_sec": 640.0,
+            "batch_size": 32,
+        }
+
+        _write_full_artifact(monitor, sidecar)
+
+        artifact_path = tmp_path / "alloc_artifact.json.gz"
+        assert artifact_path.exists()
+
+        with gzip.open(str(artifact_path), "rt") as f:
+            data = json.load(f)
+
+        assert data["hardware"]["gpu_name"] == "A100"
+        assert data["probe"]["probe_mode"] == "callback"
+        assert data["probe"]["step_time_ms_p50"] == 50.0
+        assert data["probe"]["step_count"] == 100
+        assert data["probe"]["framework"] == "huggingface"
+
+    def test_empty_monitor_still_works(self, tmp_path, monkeypatch):
+        """With empty monitor results, artifact is still written (timing only)."""
+        monkeypatch.chdir(tmp_path)
+
+        monitor = MagicMock()
+        monitor.get_results.return_value = ({}, {})
+
+        sidecar = {"framework": "huggingface", "step_count": 10}
+        _write_full_artifact(monitor, sidecar)
+
+        # With empty results, write_report gets None for both — still writes
+        artifact_path = tmp_path / "alloc_artifact.json.gz"
+        assert artifact_path.exists()
+
+
+# ── HF Callback artifact integration ───────────────────────────────────
+
+
+class TestHFCallbackArtifact:
+    def test_writes_artifact_on_train_end(self, tmp_path, monkeypatch):
+        """HF callback writes alloc_artifact.json.gz on on_train_end."""
+        from alloc.callbacks import AllocCallback
+
+        try:
+            cb = AllocCallback()
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        monkeypatch.chdir(tmp_path)
+
+        # Replace monitor with mock
+        mock_monitor = MagicMock()
+        mock_monitor.get_results.return_value = (
+            {"gpu_name": "V100"},
+            {"peak_vram_mb": 16000.0, "probe_mode": "callback", "samples": []},
+        )
+        cb._monitor = mock_monitor
+        cb._monitor_started = True
+
+        class FakeArgs:
+            per_device_train_batch_size = 8
+            gradient_accumulation_steps = 1
+
+        class FakeState:
+            global_step = 50
+
+        # Simulate some steps
+        times = iter([1.0, 1.1, 1.1, 1.2])
+        with patch("alloc.callbacks.time") as mock_time:
+            mock_time.monotonic = lambda: next(times)
+            mock_time.time = lambda: 100.0
+            cb.on_step_begin(FakeArgs(), FakeState(), None)
+            cb.on_step_end(FakeArgs(), FakeState(), None)
+            cb.on_step_begin(FakeArgs(), FakeState(), None)
+            cb.on_step_end(FakeArgs(), FakeState(), None)
+
+        cb.on_train_end(FakeArgs(), FakeState(), None)
+
+        # Monitor should have been stopped
+        mock_monitor.stop.assert_called_once()
+
+        # Artifact should be written
+        artifact_path = tmp_path / "alloc_artifact.json.gz"
+        assert artifact_path.exists()
+
+    def test_still_writes_sidecar(self, tmp_path, monkeypatch):
+        """HF callback still writes .alloc_callback.json for backwards compat."""
+        from alloc.callbacks import AllocCallback
+
+        try:
+            cb = AllocCallback()
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        monkeypatch.chdir(tmp_path)
+
+        # Replace monitor with no-op mock
+        mock_monitor = MagicMock()
+        mock_monitor.get_results.return_value = ({}, {})
+        cb._monitor = mock_monitor
+        cb._monitor_started = True
+
+        class FakeArgs:
+            per_device_train_batch_size = 8
+            gradient_accumulation_steps = 1
+
+        class FakeState:
+            global_step = 10
+
+        times = iter([1.0, 1.1])
+        with patch("alloc.callbacks.time") as mock_time:
+            mock_time.monotonic = lambda: next(times)
+            mock_time.time = lambda: 100.0
+            cb.on_step_begin(FakeArgs(), FakeState(), None)
+            cb.on_step_end(FakeArgs(), FakeState(), None)
+
+        cb.on_train_end(FakeArgs(), FakeState(), None)
+
+        sidecar_path = tmp_path / ".alloc_callback.json"
+        assert sidecar_path.exists()
+        data = json.loads(sidecar_path.read_text())
+        assert data["framework"] == "huggingface"
+
+
+# ── Lightning Callback artifact integration ─────────────────────────────
+
+
+class TestLightningCallbackArtifact:
+    def test_writes_artifact_on_train_end(self, tmp_path, monkeypatch):
+        """Lightning callback writes artifact on on_train_end."""
+        from alloc.callbacks import AllocLightningCallback
+
+        try:
+            cb = AllocLightningCallback()
+        except ImportError:
+            pytest.skip("lightning not installed")
+
+        monkeypatch.chdir(tmp_path)
+
+        mock_monitor = MagicMock()
+        mock_monitor.get_results.return_value = (
+            {"gpu_name": "A100"},
+            {"peak_vram_mb": 40000.0, "probe_mode": "callback", "samples": []},
+        )
+        cb._monitor = mock_monitor
+        cb._monitor_started = True
+
+        class FakeTrainer:
+            global_step = 25
+            datamodule = None
+
+        times = iter([1.0, 1.1])
+        with patch("alloc.callbacks.time") as mock_time:
+            mock_time.monotonic = lambda: next(times)
+            mock_time.time = lambda: 100.0
+            cb.on_train_batch_start(FakeTrainer(), None, [1, 2, 3, 4], 0)
+            cb.on_train_batch_end(FakeTrainer(), None, None, [1, 2, 3, 4], 0)
+
+        cb.on_train_end(FakeTrainer(), None)
+
+        mock_monitor.stop.assert_called_once()
+        artifact_path = tmp_path / "alloc_artifact.json.gz"
+        assert artifact_path.exists()

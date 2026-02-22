@@ -378,3 +378,235 @@ def test_raw_kwargs(tmp_path):
     raw = findings.dataloaders[0].raw_kwargs
     assert "num_workers" in raw
     assert "pin_memory" in raw
+
+
+# ---------------------------------------------------------------------------
+# DeepSpeed detection
+# ---------------------------------------------------------------------------
+
+def test_data_parallel_detected(tmp_path):
+    p = _write_script(tmp_path, """
+        import torch.nn as nn
+        model = nn.DataParallel(model)
+    """)
+    findings = analyze_script(p)
+    dp = [d for d in findings.distributed if d.kind == "data_parallel"]
+    assert len(dp) == 1
+
+
+def test_data_parallel_not_confused_with_ddp(tmp_path):
+    """DataParallel detection should not trigger on DistributedDataParallel."""
+    p = _write_script(tmp_path, """
+        from torch.nn.parallel import DistributedDataParallel
+        model = DistributedDataParallel(model)
+    """)
+    findings = analyze_script(p)
+    dp = [d for d in findings.distributed if d.kind == "data_parallel"]
+    assert len(dp) == 0
+    ddp = [d for d in findings.distributed if d.kind == "ddp"]
+    assert len(ddp) == 1
+
+
+def test_deepspeed_initialize(tmp_path):
+    p = _write_script(tmp_path, """
+        import deepspeed
+        model, optimizer, _, _ = deepspeed.initialize(model=model, config="ds_config.json")
+    """)
+    findings = analyze_script(p)
+    ds = [d for d in findings.distributed if d.kind == "deepspeed"]
+    assert len(ds) == 1
+
+
+def test_deepspeed_via_training_args(tmp_path):
+    p = _write_script(tmp_path, """
+        from transformers import TrainingArguments
+        args = TrainingArguments(output_dir="./out", deepspeed="ds_config.json")
+    """)
+    findings = analyze_script(p)
+    ds = [d for d in findings.distributed if d.kind == "deepspeed"]
+    assert len(ds) == 1
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace Accelerate detection
+# ---------------------------------------------------------------------------
+
+def test_accelerate_accelerator(tmp_path):
+    p = _write_script(tmp_path, """
+        from accelerate import Accelerator
+        accelerator = Accelerator()
+    """)
+    findings = analyze_script(p)
+    acc = [d for d in findings.distributed if d.kind == "accelerate"]
+    assert len(acc) == 1
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace Trainer / TrainingArguments detection
+# ---------------------------------------------------------------------------
+
+def test_hf_trainer_detected(tmp_path):
+    p = _write_script(tmp_path, """
+        from transformers import Trainer, TrainingArguments
+        args = TrainingArguments(output_dir="./out")
+        trainer = Trainer(model=model, args=args)
+    """)
+    findings = analyze_script(p)
+    hf = [d for d in findings.distributed if d.kind == "hf_trainer"]
+    assert len(hf) == 1
+    assert findings.has_training_loop is True
+
+
+def test_training_args_fp16(tmp_path):
+    p = _write_script(tmp_path, """
+        from transformers import TrainingArguments
+        args = TrainingArguments(output_dir="./out", fp16=True)
+    """)
+    findings = analyze_script(p)
+    prec = [pr for pr in findings.precision if pr.dtype_str == "float16"]
+    assert len(prec) == 1
+
+
+def test_training_args_bf16(tmp_path):
+    p = _write_script(tmp_path, """
+        from transformers import TrainingArguments
+        args = TrainingArguments(output_dir="./out", bf16=True)
+    """)
+    findings = analyze_script(p)
+    prec = [pr for pr in findings.precision if pr.dtype_str == "bfloat16"]
+    assert len(prec) == 1
+
+
+def test_training_args_grad_accum(tmp_path):
+    p = _write_script(tmp_path, """
+        from transformers import TrainingArguments
+        args = TrainingArguments(output_dir="./out", gradient_accumulation_steps=4)
+    """)
+    findings = analyze_script(p)
+    assert findings.gradient_accumulation_steps == 4
+
+
+def test_training_args_no_precision(tmp_path):
+    """TrainingArguments without fp16/bf16 should not add precision findings."""
+    p = _write_script(tmp_path, """
+        from transformers import TrainingArguments
+        args = TrainingArguments(output_dir="./out", learning_rate=5e-5)
+    """)
+    findings = analyze_script(p)
+    assert len(findings.precision) == 0
+    assert findings.gradient_accumulation_steps is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-file import following
+# ---------------------------------------------------------------------------
+
+def test_follow_local_import_model(tmp_path):
+    """Follow local import to find model in separate file."""
+    # model.py with from_pretrained
+    model_file = tmp_path / "model.py"
+    model_file.write_text(textwrap.dedent("""
+        from transformers import AutoModelForCausalLM
+        def get_model():
+            return AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+    """))
+
+    # train.py imports from model.py
+    train_file = tmp_path / "train.py"
+    train_file.write_text(textwrap.dedent("""
+        from model import get_model
+        from torch.utils.data import DataLoader
+        model = get_model()
+        loader = DataLoader(dataset, num_workers=2)
+    """))
+
+    findings = analyze_script(str(train_file))
+    # Should find the model from the imported file
+    fp = [m for m in findings.models if m.kind == "from_pretrained"]
+    assert len(fp) == 1
+    assert fp[0].model_name == "meta-llama/Llama-2-7b-hf"
+    # DataLoader from main script should still be found
+    assert len(findings.dataloaders) == 1
+
+
+def test_follow_local_import_optimizer(tmp_path):
+    """Follow local import to find optimizer in separate file."""
+    optim_file = tmp_path / "optim_setup.py"
+    optim_file.write_text(textwrap.dedent("""
+        from torch.optim import AdamW
+        def make_optimizer(model):
+            return AdamW(model.parameters(), lr=1e-4)
+    """))
+
+    train_file = tmp_path / "train.py"
+    train_file.write_text(textwrap.dedent("""
+        from optim_setup import make_optimizer
+        import torch
+        model = torch.nn.Linear(10, 10)
+    """))
+
+    findings = analyze_script(str(train_file))
+    assert len(findings.optimizers) == 1
+    assert findings.optimizers[0].optimizer_type == "AdamW"
+
+
+def test_follow_import_skips_pip_packages(tmp_path):
+    """Should not follow imports from pip packages (dotted modules)."""
+    train_file = tmp_path / "train.py"
+    train_file.write_text(textwrap.dedent("""
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained("gpt2")
+    """))
+
+    findings = analyze_script(str(train_file))
+    # Should find the model from direct code, but NOT try to follow 'transformers'
+    assert len(findings.models) == 1
+    assert len(findings.parse_errors) == 0
+
+
+def test_follow_import_missing_file(tmp_path):
+    """Should silently skip imports where the file doesn't exist."""
+    train_file = tmp_path / "train.py"
+    train_file.write_text(textwrap.dedent("""
+        from nonexistent_module import something
+        import torch
+    """))
+
+    findings = analyze_script(str(train_file))
+    assert len(findings.parse_errors) == 0  # Should not error
+
+
+def test_follow_import_syntax_error(tmp_path):
+    """Should silently skip imported files with syntax errors."""
+    bad_file = tmp_path / "bad_module.py"
+    bad_file.write_text("def broken(:\n")
+
+    train_file = tmp_path / "train.py"
+    train_file.write_text(textwrap.dedent("""
+        from bad_module import something
+        import torch
+    """))
+
+    findings = analyze_script(str(train_file))
+    assert len(findings.parse_errors) == 0  # Main script is fine
+
+
+def test_follow_import_distributed(tmp_path):
+    """Follow local import to find distributed setup."""
+    dist_file = tmp_path / "distributed.py"
+    dist_file.write_text(textwrap.dedent("""
+        import torch.distributed as dist
+        def setup():
+            dist.init_process_group("nccl")
+    """))
+
+    train_file = tmp_path / "train.py"
+    train_file.write_text(textwrap.dedent("""
+        from distributed import setup
+        setup()
+    """))
+
+    findings = analyze_script(str(train_file))
+    ipg = [d for d in findings.distributed if d.kind == "init_process_group"]
+    assert len(ipg) == 1
+    assert ipg[0].backend == "nccl"

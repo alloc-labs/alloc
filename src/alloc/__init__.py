@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 from alloc.ghost import ghost, GhostReport
 from alloc.callbacks import AllocCallback as HuggingFaceCallback

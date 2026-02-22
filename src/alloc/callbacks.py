@@ -1,7 +1,11 @@
-"""Alloc Framework Callbacks — capture training step timing for artifact enrichment.
+"""Alloc Framework Callbacks — self-contained GPU monitoring + step timing.
 
-Callbacks for popular ML frameworks. Write timing stats to a sidecar file
-(.alloc_callback.json) so the probe can capture throughput and step latency.
+Each callback captures GPU metrics (VRAM, utilization, power) via a background
+NVML thread AND step timing, then writes a full alloc_artifact.json.gz on
+train_end. No ``alloc run`` wrapper needed.
+
+Also writes the legacy sidecar (.alloc_callback.json) for backwards compat
+with ``alloc run`` workflows.
 
 Usage (HuggingFace):
     from alloc.callbacks import AllocCallback
@@ -17,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -119,13 +124,225 @@ def _build_sidecar(
     return data
 
 
+# ── NVML Monitor ────────────────────────────────────────────────────────
+
+_NVML_POLL_INTERVAL_S = 2.0
+
+
+def _try_import_pynvml():
+    """Try to import pynvml. Returns module or None."""
+    try:
+        import pynvml
+        return pynvml
+    except ImportError:
+        return None
+
+
+class _NvmlMonitor:
+    """Background NVML sampling thread for callbacks.
+
+    Gracefully no-ops if pynvml is not installed or NVML init fails.
+    """
+
+    def __init__(self):
+        # type: () -> None
+        self._pynvml = _try_import_pynvml()
+        self._thread = None  # type: Optional[threading.Thread]
+        self._stop_event = threading.Event()
+        self._samples = []  # type: List[Dict[str, Any]]
+        self._hw_context = {}  # type: Dict[str, Any]
+        self._start_time = 0.0
+
+    @property
+    def available(self):
+        # type: () -> bool
+        return self._pynvml is not None
+
+    def start(self):
+        # type: () -> None
+        """Init NVML, capture hardware context, spawn sampling daemon."""
+        if self._pynvml is None:
+            return
+        try:
+            self._pynvml.nvmlInit()
+        except Exception:
+            self._pynvml = None
+            return
+
+        self._start_time = time.time()
+
+        # Capture hardware context from GPU 0
+        try:
+            handle = self._pynvml.nvmlDeviceGetHandleByIndex(0)
+
+            name = self._pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8")
+            mem_info = self._pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_mb = round(mem_info.total / (1024 * 1024), 1)
+
+            self._hw_context["gpu_name"] = name
+            self._hw_context["gpu_total_vram_mb"] = total_mb
+        except Exception:
+            pass
+
+        try:
+            drv = self._pynvml.nvmlSystemGetDriverVersion()
+            if isinstance(drv, bytes):
+                drv = drv.decode("utf-8")
+            self._hw_context["driver_version"] = drv
+        except Exception:
+            pass
+
+        try:
+            cuda_ver_int = self._pynvml.nvmlSystemGetCudaDriverVersion()
+            major = cuda_ver_int // 1000
+            minor = (cuda_ver_int % 1000) // 10
+            self._hw_context["cuda_version"] = "{}.{}".format(major, minor)
+        except Exception:
+            pass
+
+        try:
+            handle = self._pynvml.nvmlDeviceGetHandleByIndex(0)
+            sm_major, sm_minor = self._pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            self._hw_context["sm_version"] = "{}.{}".format(sm_major, sm_minor)
+        except Exception:
+            pass
+
+        try:
+            self._hw_context["num_gpus_detected"] = self._pynvml.nvmlDeviceGetCount()
+        except Exception:
+            self._hw_context["num_gpus_detected"] = 1
+
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
+
+    def _sample_loop(self):
+        # type: () -> None
+        """Poll GPU metrics until stop event is set."""
+        pynvml = self._pynvml
+        if pynvml is None:
+            return
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            while not self._stop_event.is_set():
+                try:
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                    self._samples.append({
+                        "t": round(time.time() - self._start_time, 2),
+                        "vram_mb": round(mem.used / (1024 * 1024), 1),
+                        "gpu_util_pct": round(float(util.gpu), 1),
+                        "power_w": round(power, 1),
+                    })
+                except Exception:
+                    pass
+                self._stop_event.wait(_NVML_POLL_INTERVAL_S)
+        except Exception:
+            pass
+
+    def stop(self):
+        # type: () -> None
+        """Stop sampling thread and shutdown NVML."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+        if self._pynvml is not None:
+            try:
+                self._pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    def get_results(self):
+        # type: () -> tuple
+        """Return (hw_context_dict, probe_dict) matching write_report format.
+
+        If NVML was unavailable, returns ({}, {}).
+        """
+        if not self._hw_context and not self._samples:
+            return {}, {}
+
+        duration = round(time.time() - self._start_time, 2) if self._start_time else 0.0
+
+        peak_vram = 0.0
+        total_util = 0.0
+        total_power = 0.0
+        for s in self._samples:
+            vram = s.get("vram_mb", 0.0)
+            if vram > peak_vram:
+                peak_vram = vram
+            total_util += s.get("gpu_util_pct", 0.0)
+            total_power += s.get("power_w", 0.0)
+
+        n = len(self._samples)
+        avg_util = round(total_util / n, 1) if n else 0.0
+        avg_power = round(total_power / n, 1) if n else 0.0
+
+        probe_dict = {
+            "peak_vram_mb": round(peak_vram, 1),
+            "avg_gpu_util": avg_util,
+            "avg_power_watts": avg_power,
+            "duration_seconds": duration,
+            "samples": list(self._samples),
+            "gpu_name": self._hw_context.get("gpu_name"),
+            "gpu_total_vram_mb": self._hw_context.get("gpu_total_vram_mb"),
+            "num_gpus_detected": self._hw_context.get("num_gpus_detected", 1),
+            "probe_mode": "callback",
+        }
+
+        hw_context = dict(self._hw_context)
+        return hw_context, probe_dict
+
+
+# ── Artifact helper ─────────────────────────────────────────────────────
+
+def _write_full_artifact(monitor, sidecar_data):
+    # type: (_NvmlMonitor, Dict[str, Any]) -> None
+    """Merge monitor GPU data + callback timing into a full artifact.
+
+    Writes alloc_artifact.json.gz via artifact_writer.write_report().
+    Silent no-op on any failure.
+    """
+    try:
+        hw_context, probe_dict = monitor.get_results()
+
+        # Merge step timing from sidecar into probe_dict
+        if probe_dict:
+            for key in ("step_time_ms_p50", "step_time_ms_p90", "step_time_ms_mean",
+                        "step_time_ms_std", "samples_per_sec", "step_count", "batch_size",
+                        "framework"):
+                val = sidecar_data.get(key)
+                if val is not None:
+                    probe_dict[key] = val
+
+            if sidecar_data.get("is_distributed"):
+                probe_dict["is_distributed"] = True
+                probe_dict["rank"] = sidecar_data.get("rank", 0)
+                probe_dict["world_size"] = sidecar_data.get("world_size", 1)
+
+        from alloc.artifact_writer import write_report
+        write_report(
+            probe_result=probe_dict if probe_dict else None,
+            hardware_context=hw_context if hw_context else None,
+        )
+    except Exception:
+        pass
+
+
 # ── HuggingFace Callback ─────────────────────────────────────────────────
 
 try:
     from transformers import TrainerCallback
 
     class AllocCallback(TrainerCallback):
-        """HuggingFace Trainer callback that captures step timing for Alloc."""
+        """HuggingFace Trainer callback — GPU metrics + step timing.
+
+        Self-contained: spawns an NVML monitor thread for GPU metrics and
+        writes a full alloc_artifact.json.gz on train_end. No ``alloc run``
+        wrapper required.
+        """
 
         def __init__(self):
             # type: () -> None
@@ -138,9 +355,14 @@ try:
             self._is_distributed = False  # type: bool
             self._rank = 0               # type: int
             self._world_size = 1         # type: int
+            self._monitor = _NvmlMonitor()
+            self._monitor_started = False  # type: bool
 
         def on_step_begin(self, args, state, control, **kwargs):
             self._step_start = time.monotonic()
+            if not self._monitor_started:
+                self._monitor.start()
+                self._monitor_started = True
             if not self._dist_checked:
                 self._is_distributed, self._rank, self._world_size = _detect_distributed()
                 self._dist_checked = True
@@ -169,10 +391,12 @@ try:
 
         def on_train_end(self, args, state, control, **kwargs):
             self.step_count = state.global_step
-            self._flush()
+            self._monitor.stop()
+            sidecar = self._flush()
+            _write_full_artifact(self._monitor, sidecar)
 
         def _flush(self):
-            # type: () -> None
+            # type: () -> Dict[str, Any]
             data = _build_sidecar(
                 framework="huggingface",
                 step_count=self.step_count,
@@ -183,6 +407,7 @@ try:
                 world_size=self._world_size,
             )
             _write_callback_data(data)
+            return data
 
 except ImportError:
     class AllocCallback:  # type: ignore[no-redef]
@@ -201,7 +426,12 @@ try:
     from lightning.pytorch.callbacks import Callback as LightningBaseCallback
 
     class AllocLightningCallback(LightningBaseCallback):
-        """PyTorch Lightning callback that captures step timing for Alloc."""
+        """PyTorch Lightning callback — GPU metrics + step timing.
+
+        Self-contained: spawns an NVML monitor thread for GPU metrics and
+        writes a full alloc_artifact.json.gz on train_end. No ``alloc run``
+        wrapper required.
+        """
 
         def __init__(self):
             # type: () -> None
@@ -215,9 +445,14 @@ try:
             self._is_distributed = False  # type: bool
             self._rank = 0               # type: int
             self._world_size = 1         # type: int
+            self._monitor = _NvmlMonitor()
+            self._monitor_started = False  # type: bool
 
         def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
             self._step_start = time.monotonic()
+            if not self._monitor_started:
+                self._monitor.start()
+                self._monitor_started = True
             if not self._dist_checked:
                 self._is_distributed, self._rank, self._world_size = _detect_distributed()
                 self._dist_checked = True
@@ -251,10 +486,12 @@ try:
 
         def on_train_end(self, trainer, pl_module):
             self.step_count = trainer.global_step
-            self._flush()
+            self._monitor.stop()
+            sidecar = self._flush()
+            _write_full_artifact(self._monitor, sidecar)
 
         def _flush(self):
-            # type: () -> None
+            # type: () -> Dict[str, Any]
             data = _build_sidecar(
                 framework="lightning",
                 step_count=self.step_count,
@@ -265,6 +502,7 @@ try:
                 world_size=self._world_size,
             )
             _write_callback_data(data)
+            return data
 
 except ImportError:
     class AllocLightningCallback:  # type: ignore[no-redef]

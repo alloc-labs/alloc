@@ -77,6 +77,7 @@ class CodeFindings:
     models: List[ModelFinding] = field(default_factory=list)
     imports: Dict[str, str] = field(default_factory=dict)
     has_training_loop: bool = False
+    gradient_accumulation_steps: Optional[int] = None
     parse_errors: List[str] = field(default_factory=list)
 
 
@@ -109,7 +110,11 @@ def analyze_script(script_path: str) -> CodeFindings:
     findings.precision = _find_precision(tree, findings.imports, lines, script_path)
     findings.distributed = _find_distributed(tree, findings.imports, lines, script_path)
     findings.models = _find_models(tree, findings.imports, lines, script_path)
-    findings.has_training_loop = _detect_training_loop(tree)
+    _extract_training_args(tree, findings, lines, script_path)
+    findings.has_training_loop = _detect_training_loop(tree, findings)
+
+    # Follow local imports one level deep
+    _follow_local_imports(tree, findings, script_path)
 
     return findings
 
@@ -472,6 +477,15 @@ def _find_distributed(
             ))
             continue
 
+        # DataParallel (not DDP — single-process, GIL-bound, anti-pattern)
+        if fqn and "DataParallel" in fqn and "Distributed" not in fqn and "FullyShard" not in fqn:
+            results.append(DistributedFinding(
+                location=_loc(script_path, node, lines),
+                kind="data_parallel",
+                backend=None,
+            ))
+            continue
+
         # FSDP
         if "FullyShardedDataParallel" in fqn or fqn.endswith(".FSDP"):
             results.append(DistributedFinding(
@@ -506,6 +520,38 @@ def _find_distributed(
                 backend=None,
             ))
             continue
+
+        # DeepSpeed: deepspeed.initialize(...)
+        if "deepspeed" in fqn and "initialize" in fqn:
+            results.append(DistributedFinding(
+                location=_loc(script_path, node, lines),
+                kind="deepspeed",
+                backend=None,
+            ))
+            continue
+
+        # HuggingFace Accelerate: Accelerator(...)
+        if fqn and ("Accelerator" in fqn) and "accelerate" in imports.get(fqn.split(".")[0], fqn).lower():
+            results.append(DistributedFinding(
+                location=_loc(script_path, node, lines),
+                kind="accelerate",
+                backend=None,
+            ))
+            continue
+
+    # Also detect Accelerator via direct import resolution
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fqn = _resolve_call_name(node, imports)
+        if fqn and fqn in ("accelerate.Accelerator", "Accelerator") and "Accelerator" in imports:
+            if imports.get("Accelerator", "").startswith("accelerate"):
+                if not any(d.kind == "accelerate" for d in results):
+                    results.append(DistributedFinding(
+                        location=_loc(script_path, node, lines),
+                        kind="accelerate",
+                        backend=None,
+                    ))
 
     return results
 
@@ -577,10 +623,110 @@ def _is_cudnn_benchmark(node: ast.Attribute) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# HuggingFace TrainingArguments extraction
+# ---------------------------------------------------------------------------
+
+_TRAINING_ARGS_NAMES = {
+    "transformers.TrainingArguments",
+    "transformers.Seq2SeqTrainingArguments",
+    "TrainingArguments",
+    "Seq2SeqTrainingArguments",
+}
+
+_HF_TRAINER_NAMES = {
+    "transformers.Trainer",
+    "transformers.Seq2SeqTrainer",
+    "Trainer",
+    "Seq2SeqTrainer",
+}
+
+
+def _extract_training_args(
+    tree: ast.AST,
+    findings: CodeFindings,
+    lines: List[str],
+    script_path: str,
+) -> None:
+    """Extract HuggingFace TrainingArguments and Trainer patterns.
+
+    Detects: fp16, bf16, gradient_accumulation_steps, deepspeed config.
+    Adds precision findings and sets gradient_accumulation_steps on CodeFindings.
+    """
+    imports = findings.imports
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fqn = _resolve_call_name(node, imports)
+        if fqn is None:
+            continue
+
+        # Check for TrainingArguments(...)
+        is_training_args = False
+        for ta_name in _TRAINING_ARGS_NAMES:
+            if fqn == ta_name or fqn.endswith(f".{ta_name.split('.')[-1]}"):
+                is_training_args = True
+                break
+
+        if not is_training_args:
+            # Check for Trainer(...) — also mark as distributed
+            is_trainer = False
+            for t_name in _HF_TRAINER_NAMES:
+                if fqn == t_name or fqn.endswith(f".{t_name.split('.')[-1]}"):
+                    is_trainer = True
+                    break
+            if is_trainer:
+                # Trainer implies training loop
+                findings.distributed.append(DistributedFinding(
+                    location=_loc(script_path, node, lines),
+                    kind="hf_trainer",
+                    backend=None,
+                ))
+            continue
+
+        # Extract TrainingArguments kwargs
+        fp16 = _get_kwarg_constant(node, "fp16")
+        bf16 = _get_kwarg_constant(node, "bf16")
+        grad_accum = _get_kwarg_constant(node, "gradient_accumulation_steps")
+        deepspeed_arg = _has_kwarg(node, "deepspeed")
+
+        if fp16 is True:
+            findings.precision.append(PrecisionFinding(
+                location=_loc(script_path, node, lines),
+                kind="autocast",
+                dtype_str="float16",
+                is_deprecated_api=False,
+            ))
+
+        if bf16 is True:
+            findings.precision.append(PrecisionFinding(
+                location=_loc(script_path, node, lines),
+                kind="autocast",
+                dtype_str="bfloat16",
+                is_deprecated_api=False,
+            ))
+
+        if grad_accum is not None:
+            try:
+                findings.gradient_accumulation_steps = int(grad_accum)
+            except (ValueError, TypeError):
+                pass
+
+        if deepspeed_arg:
+            # TrainingArguments(deepspeed="ds_config.json") implies DeepSpeed
+            if not any(d.kind == "deepspeed" for d in findings.distributed):
+                findings.distributed.append(DistributedFinding(
+                    location=_loc(script_path, node, lines),
+                    kind="deepspeed",
+                    backend=None,
+                ))
+
+
+# ---------------------------------------------------------------------------
 # Training loop detection
 # ---------------------------------------------------------------------------
 
-def _detect_training_loop(tree: ast.AST) -> bool:
+def _detect_training_loop(tree: ast.AST, findings: Optional[CodeFindings] = None) -> bool:
     """Heuristic: detect if script contains a training loop.
 
     Looks for patterns like:
@@ -588,7 +734,12 @@ def _detect_training_loop(tree: ast.AST) -> bool:
       - loss.backward()
       - optimizer.step()
       - .train() call
+      - HuggingFace Trainer instantiation
     """
+    # HuggingFace Trainer counts as a training loop
+    if findings and any(d.kind == "hf_trainer" for d in findings.distributed):
+        return True
+
     has_backward = False
     has_step = False
     has_for_loop = False
@@ -616,3 +767,107 @@ def _detect_training_loop(tree: ast.AST) -> bool:
         return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Multi-file import following (1-level deep)
+# ---------------------------------------------------------------------------
+
+def _follow_local_imports(
+    tree: ast.AST,
+    findings: CodeFindings,
+    script_path: str,
+) -> None:
+    """Follow local imports one level deep to catch patterns split across files.
+
+    Only follows imports from the same directory. Skips pip packages.
+    Merges model, distributed, precision, and optimizer findings from imported files.
+    Does NOT merge DataLoader findings (those should be declared in the main script).
+    """
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    followed = set()  # type: set
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+
+        # Only handle `from X import ...` where X is a local module
+        if isinstance(node, ast.ImportFrom):
+            module_name = node.module
+            if module_name is None:
+                continue
+            # Skip stdlib and pip packages (heuristic: contains dots or known prefixes)
+            if "." in module_name:
+                continue
+            candidate = os.path.join(script_dir, module_name + ".py")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.name
+                if "." in name:
+                    continue
+                candidate = os.path.join(script_dir, name + ".py")
+                if os.path.isfile(candidate) and candidate not in followed:
+                    followed.add(candidate)
+                    _merge_imported_findings(candidate, findings)
+            continue
+        else:
+            continue
+
+        if not os.path.isfile(candidate):
+            continue
+        if candidate in followed:
+            continue
+
+        followed.add(candidate)
+        _merge_imported_findings(candidate, findings)
+
+
+def _merge_imported_findings(
+    imported_path: str,
+    main_findings: CodeFindings,
+) -> None:
+    """Analyze an imported file and merge relevant findings into main findings.
+
+    Merges: models, distributed, precision, optimizers, gradient_accumulation_steps.
+    Does NOT merge: dataloaders, training loop, imports (those belong to the main script).
+    """
+    try:
+        with open(imported_path, "r") as f:
+            source = f.read()
+        lines = source.splitlines()
+        tree = ast.parse(source, filename=imported_path)
+    except (SyntaxError, OSError):
+        return
+
+    imports = _walk_imports(tree)
+
+    # Merge models
+    for model in _find_models(tree, imports, lines, imported_path):
+        main_findings.models.append(model)
+
+    # Merge distributed
+    for dist in _find_distributed(tree, imports, lines, imported_path):
+        main_findings.distributed.append(dist)
+
+    # Merge precision
+    for prec in _find_precision(tree, imports, lines, imported_path):
+        main_findings.precision.append(prec)
+
+    # Merge optimizers
+    for opt in _find_optimizers(tree, imports, lines, imported_path):
+        main_findings.optimizers.append(opt)
+
+    # Extract TrainingArguments from imported file
+    sub_findings = CodeFindings(script_path=imported_path)
+    sub_findings.imports = imports
+    sub_findings.distributed = list(main_findings.distributed)
+    _extract_training_args(tree, sub_findings, lines, imported_path)
+
+    # Merge TrainingArguments precision findings
+    for prec in sub_findings.precision:
+        if prec not in main_findings.precision:
+            main_findings.precision.append(prec)
+
+    # Merge gradient_accumulation_steps
+    if sub_findings.gradient_accumulation_steps is not None and main_findings.gradient_accumulation_steps is None:
+        main_findings.gradient_accumulation_steps = sub_findings.gradient_accumulation_steps
