@@ -100,7 +100,7 @@ def run(
     gpu: int = typer.Option(0, help="GPU index to monitor"),
     save: bool = typer.Option(True, help="Save artifact to disk"),
     out: Optional[str] = typer.Option(None, "--out", help="Output path for artifact"),
-    upload: bool = typer.Option(False, "--upload", help="Upload artifact to Alloc dashboard after run (automatic when logged in)"),
+    upload: bool = typer.Option(False, "--upload", help="Upload artifact to Alloc dashboard after run"),
     no_upload: bool = typer.Option(False, "--no-upload", help="Skip auto-upload even when logged in"),
     full: bool = typer.Option(False, "--full", help="Monitor full training run instead of calibrating"),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),

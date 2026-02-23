@@ -115,6 +115,8 @@ def upload_artifact(artifact_path: str, api_url: str, token: str) -> dict:
         "step_time_ms_p90": probe.get("step_time_ms_p90"),
         "samples_per_sec": probe.get("samples_per_sec"),
         "dataloader_wait_pct": probe.get("dataloader_wait_pct"),
+        "comm_overhead_pct": probe.get("comm_overhead_pct"),
+        "per_rank_peak_vram_mb": probe.get("per_rank_peak_vram_mb"),
         "ghost_report": ghost if ghost else None,
         "source": probe.get("source") or "cli",
         "command": probe.get("command"),

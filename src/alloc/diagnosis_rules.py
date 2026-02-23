@@ -1165,7 +1165,7 @@ def _check_step_time_straggler(
     rank_medians = []
     for rank_idx, times in enumerate(artifact.per_rank_step_times_ms):
         if not times:
-            return []
+            continue  # Skip ranks with missing data instead of aborting
         median_t = _median(times)
         rank_medians.append((rank_idx, median_t))
 

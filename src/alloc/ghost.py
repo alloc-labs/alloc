@@ -25,13 +25,19 @@ BYTES_PER_DTYPE = {
     "bf16": 2,
 }
 
-# Adam: params (fp32) + momentum (fp32) + variance (fp32) = 3 states * 4 bytes
-# Optimizer state multiplier for mixed-precision training.
-OPTIMIZER_BYTES_PER_PARAM = 12
+# Adam optimizer state sizing:
+#   Mixed precision (fp16/bf16): master copy (fp32) + momentum (fp32) + variance (fp32) = 12 bytes/param
+#   Full precision (fp32):       momentum (fp32) + variance (fp32) = 8 bytes/param (no master copy needed)
+OPTIMIZER_BYTES_MIXED = 12   # fp16/bf16 training
+OPTIMIZER_BYTES_FP32 = 8     # fp32 training
 
 # Buffer overhead: 10% of (weights + gradients + activations + optimizer)
 # for fragmentation and temp allocations.
 BUFFER_OVERHEAD_FACTOR = 0.1
+
+# Rough transformer param formula: P ≈ 12 * hidden_dim^2 * num_layers
+# Used to estimate num_layers when not provided explicitly.
+_TRANSFORMER_PARAM_FACTOR = 12
 
 
 @dataclass
@@ -119,18 +125,29 @@ def _ghost_impl(
     elif param_count is not None:
         resolved_count = param_count
     elif param_count_b is not None:
-        resolved_count = int(param_count_b * 1e9)
+        resolved_count = round(param_count_b * 1e9)
 
     if resolved_count <= 0:
         resolved_count = 0
 
     bytes_per_param = BYTES_PER_DTYPE.get(resolved_dtype, 2)
+    is_mixed = bytes_per_param <= 2  # fp16, bf16, int8, int4
+    optimizer_bpp = OPTIMIZER_BYTES_MIXED if is_mixed else OPTIMIZER_BYTES_FP32
     to_gb = 1.0 / (1024 ** 3)
 
+    # Mixed precision: gradients stored in fp32 during backward pass
+    grad_bytes_per_param = 4 if is_mixed else bytes_per_param
     weights_bytes = resolved_count * bytes_per_param
-    gradients_bytes = resolved_count * bytes_per_param
-    optimizer_bytes = resolved_count * OPTIMIZER_BYTES_PER_PARAM
-    activations_bytes = batch_size * seq_length * hidden_dim * bytes_per_param
+    gradients_bytes = resolved_count * grad_bytes_per_param
+    optimizer_bytes = resolved_count * optimizer_bpp
+
+    # Estimate num_layers for activation sizing: P ≈ 12 * H^2 * L
+    est_layers = 1
+    if resolved_count > 0 and hidden_dim > 0:
+        est_layers = max(1, round(resolved_count / (_TRANSFORMER_PARAM_FACTOR * hidden_dim * hidden_dim)))
+    # Per-layer activation: B * S * H * ~34 bytes (from Megatron paper)
+    # Using bytes_per_param as proxy for precision factor
+    activations_bytes = est_layers * batch_size * seq_length * hidden_dim * bytes_per_param
 
     weights_gb = weights_bytes * to_gb
     gradients_gb = gradients_bytes * to_gb

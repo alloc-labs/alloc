@@ -345,13 +345,22 @@ class _NvmlMonitor:
         else:
             duration = 0.0
 
+        # Use per-GPU peak tracking for peak_vram_mb (max across all GPUs),
+        # matching probe.py convention. The per-sample vram_mb is averaged
+        # across GPUs, so max(sample.vram_mb) would underreport on skewed
+        # multi-GPU workloads (e.g., PP where rank 0 has the embedding layer).
         peak_vram = 0.0
+        if self._per_gpu_peak_vram_mb and any(v > 0 for v in self._per_gpu_peak_vram_mb):
+            peak_vram = max(self._per_gpu_peak_vram_mb)
+        else:
+            for s in samples_copy:
+                vram = s.get("vram_mb", 0.0)
+                if vram > peak_vram:
+                    peak_vram = vram
+
         total_util = 0.0
         total_power = 0.0
         for s in samples_copy:
-            vram = s.get("vram_mb", 0.0)
-            if vram > peak_vram:
-                peak_vram = vram
             total_util += s.get("gpu_util_pct", 0.0)
             total_power += s.get("power_w", 0.0)
 
@@ -408,6 +417,9 @@ def _write_full_artifact(monitor, sidecar_data):
             val = sidecar_data.get(key)
             if val is not None:
                 probe_dict[key] = val
+
+        # Set source to "callback" for standalone callback artifacts
+        probe_dict["source"] = "callback"
 
         if sidecar_data.get("is_distributed"):
             probe_dict["is_distributed"] = True

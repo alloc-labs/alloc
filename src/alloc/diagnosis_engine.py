@@ -207,6 +207,9 @@ def _build_comparison(current: ArtifactData, previous: ArtifactData) -> Dict:
 def _build_vram_breakdown(findings: CodeFindings, artifact: ArtifactData) -> Optional[Dict]:
     """Estimate VRAM component breakdown from AST + runtime data."""
     peak = artifact.peak_vram_mb
+    # Fall back to max per-GPU VRAM if peak is not available
+    if peak is None and artifact.per_gpu_vram_used_mb:
+        peak = max(artifact.per_gpu_vram_used_mb)
     total = artifact.per_gpu_vram_total_mb
     if peak is None:
         return None
