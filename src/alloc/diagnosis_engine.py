@@ -293,7 +293,7 @@ def _build_efficiency(artifact: ArtifactData) -> Optional[Dict]:
     bottleneck_rule = None
     if dl_pct > 20:
         bottleneck = "Data loading"
-        bottleneck_rule = "DL005"
+        bottleneck_rule = "DL001"
     elif compute_pct < 50 and dl_pct < 20:
         bottleneck = "Other overhead"
 
