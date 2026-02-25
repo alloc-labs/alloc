@@ -28,6 +28,9 @@ class ModelInfo:
     dtype: str                  # "float32", "float16", etc.
     model_name: Optional[str]   # class name if found
     method: str                 # "execution" | "ast" | "manual"
+    hidden_dim: Optional[int] = None
+    num_layers: Optional[int] = None
+    seq_length: Optional[int] = None
 
 
 def extract_model_info(
@@ -115,6 +118,9 @@ def _extract_via_subprocess(
                 dtype=data.get("dtype", "float32"),
                 model_name=data.get("model_name"),
                 method="execution",
+                hidden_dim=data.get("hidden_dim"),
+                num_layers=data.get("num_layers"),
+                seq_length=data.get("seq_length"),
             )
 
         return None

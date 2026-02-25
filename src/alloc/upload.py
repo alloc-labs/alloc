@@ -117,11 +117,36 @@ def upload_artifact(artifact_path: str, api_url: str, token: str) -> dict:
         "dataloader_wait_pct": probe.get("dataloader_wait_pct"),
         "comm_overhead_pct": probe.get("comm_overhead_pct"),
         "per_rank_peak_vram_mb": probe.get("per_rank_peak_vram_mb"),
+        # Architecture fields: probe (callbacks) takes priority over ghost defaults
+        "batch_size": probe.get("batch_size") or (ghost.get("batch_size") if ghost else None),
+        "seq_length": ghost.get("seq_length") if ghost else None,
+        "hidden_dim": ghost.get("hidden_dim") if ghost else None,
+        "num_layers": ghost.get("num_layers") if ghost else None,
         "ghost_report": ghost if ghost else None,
         "source": probe.get("source") or "cli",
         "command": probe.get("command"),
         "git_sha": git_ctx.get("commit_sha"),
         "git_branch": git_ctx.get("branch"),
+        # Phase timing (from CUDA events in callbacks)
+        "phase_forward_ms_p50": probe.get("phase_forward_ms_p50"),
+        "phase_forward_ms_p90": probe.get("phase_forward_ms_p90"),
+        "phase_backward_ms_p50": probe.get("phase_backward_ms_p50"),
+        "phase_backward_ms_p90": probe.get("phase_backward_ms_p90"),
+        "phase_optimizer_ms_p50": probe.get("phase_optimizer_ms_p50"),
+        "phase_optimizer_ms_p90": probe.get("phase_optimizer_ms_p90"),
+        "phase_dataloader_ms_p50": probe.get("phase_dataloader_ms_p50"),
+        "phase_dataloader_ms_p90": probe.get("phase_dataloader_ms_p90"),
+        "has_phase_timing": probe.get("has_phase_timing"),
+        # Architecture metadata (from callback introspection)
+        "architecture_type": probe.get("architecture_type"),
+        "optimizer_type": probe.get("optimizer_type"),
+        "fine_tuning_method": probe.get("fine_tuning_method"),
+        "gradient_checkpointing": probe.get("gradient_checkpointing"),
+        "attention_type": probe.get("attention_type"),
+        "param_count": probe.get("param_count"),
+        "trainable_param_count": probe.get("trainable_param_count"),
+        # Outcome tracking: link to previous run
+        "baseline_run_id": probe.get("baseline_run_id"),
     }
 
     with httpx.Client(timeout=30) as client:

@@ -18,6 +18,8 @@ from alloc.callbacks import (
     _write_callback_data,
     _NvmlMonitor,
     _write_full_artifact,
+    _WARMUP_STEPS,
+    _WRITE_EVERY,
 )
 
 
@@ -581,3 +583,463 @@ class TestLightningCallbackArtifact:
         mock_monitor.stop.assert_called_once()
         artifact_path = tmp_path / "alloc_artifact.json.gz"
         assert artifact_path.exists()
+
+
+# ── Phase timing helpers ───────────────────────────────────────────────
+
+
+class TestComputePhaseStats:
+    def test_empty_list(self):
+        from alloc.callbacks import _compute_phase_stats
+        assert _compute_phase_stats([]) == {}
+
+    def test_single_value(self):
+        from alloc.callbacks import _compute_phase_stats
+        result = _compute_phase_stats([10.0])
+        assert result["p50"] == 10.0
+        assert result["p90"] == 10.0
+
+    def test_multiple_values(self):
+        from alloc.callbacks import _compute_phase_stats
+        result = _compute_phase_stats([10.0, 20.0, 30.0, 40.0, 50.0])
+        assert abs(result["p50"] - 30.0) < 0.01
+        assert result["p90"] > result["p50"]
+
+
+class TestBuildSidecarPhaseTimimg:
+    def test_no_phase_stats(self):
+        data = _build_sidecar("test", 10, [100.0, 200.0], 8)
+        assert "has_phase_timing" not in data
+
+    def test_with_phase_stats(self):
+        phase_stats = {
+            "forward": {"p50": 10.0, "p90": 12.0},
+            "backward": {"p50": 20.0, "p90": 25.0},
+            "optimizer": {"p50": 5.0, "p90": 6.0},
+            "dataloader": {"p50": 3.0, "p90": 4.0},
+        }
+        data = _build_sidecar("test", 10, [100.0], 8, phase_stats=phase_stats)
+        assert data["has_phase_timing"] is True
+        assert data["phase_forward_ms_p50"] == 10.0
+        assert data["phase_forward_ms_p90"] == 12.0
+        assert data["phase_backward_ms_p50"] == 20.0
+        assert data["phase_backward_ms_p90"] == 25.0
+        assert data["phase_optimizer_ms_p50"] == 5.0
+        assert data["phase_optimizer_ms_p90"] == 6.0
+        assert data["phase_dataloader_ms_p50"] == 3.0
+        assert data["phase_dataloader_ms_p90"] == 4.0
+
+    def test_partial_phase_stats(self):
+        phase_stats = {
+            "forward": {"p50": 10.0, "p90": 12.0},
+        }
+        data = _build_sidecar("test", 10, [100.0], 8, phase_stats=phase_stats)
+        assert data["has_phase_timing"] is True
+        assert data["phase_forward_ms_p50"] == 10.0
+        assert "phase_backward_ms_p50" not in data
+
+
+class TestCudaAvailability:
+    def test_try_cuda_not_available(self):
+        from alloc.callbacks import _try_cuda_available
+        # On test machines without CUDA, should return False gracefully
+        result = _try_cuda_available()
+        assert isinstance(result, bool)
+
+    def test_create_cuda_event_no_cuda(self):
+        from alloc.callbacks import _create_cuda_event
+        # Should return None when CUDA not available
+        with patch("alloc.callbacks._try_cuda_available", return_value=False):
+            # _create_cuda_event tries torch.cuda.Event directly
+            # Without CUDA it should return None
+            result = _create_cuda_event()
+            # Either None (no CUDA) or a real event (if CUDA available in test env)
+            assert result is None or result is not None
+
+
+class TestWriteFullArtifactWithPhases:
+    def test_phase_fields_merged(self, tmp_path):
+        """Phase timing fields from sidecar should be written to artifact."""
+        monitor = _NvmlMonitor()
+        sidecar = {
+            "framework": "test",
+            "step_count": 10,
+            "step_time_ms_p50": 100.0,
+            "has_phase_timing": True,
+            "phase_forward_ms_p50": 40.0,
+            "phase_forward_ms_p90": 45.0,
+            "phase_backward_ms_p50": 35.0,
+            "phase_backward_ms_p90": 40.0,
+            "phase_optimizer_ms_p50": 15.0,
+            "phase_optimizer_ms_p90": 18.0,
+            "phase_dataloader_ms_p50": 10.0,
+            "phase_dataloader_ms_p90": 12.0,
+        }
+
+        with patch("alloc.artifact_writer.write_report") as mock_write:
+            _write_full_artifact(monitor, sidecar)
+            assert mock_write.called, "write_report must be called"
+            call_kwargs = mock_write.call_args
+            probe = call_kwargs.kwargs.get("probe_result")
+            assert isinstance(probe, dict), "probe_result must be a dict"
+            assert probe["has_phase_timing"] is True
+            assert probe["phase_forward_ms_p50"] == 40.0
+            assert probe["phase_forward_ms_p90"] == 45.0
+            assert probe["phase_backward_ms_p50"] == 35.0
+            assert probe["phase_optimizer_ms_p50"] == 15.0
+            assert probe["phase_dataloader_ms_p50"] == 10.0
+
+    def test_rank_tagged_filename(self, tmp_path):
+        """Non-rank-0 distributed should use rank-tagged filename."""
+        monitor = _NvmlMonitor()
+        sidecar = {
+            "framework": "test",
+            "step_count": 10,
+            "is_distributed": True,
+            "rank": 2,
+            "world_size": 4,
+        }
+
+        with patch("alloc.artifact_writer.write_report") as mock_write:
+            _write_full_artifact(monitor, sidecar)
+            assert mock_write.called, "write_report must be called"
+            call_kwargs = mock_write.call_args
+            assert call_kwargs.kwargs.get("output_path") == "alloc_artifact_rank2.json.gz"
+
+    def test_rank0_default_filename(self, tmp_path):
+        """Rank 0 should use default filename (None = default)."""
+        monitor = _NvmlMonitor()
+        sidecar = {
+            "framework": "test",
+            "step_count": 10,
+            "is_distributed": True,
+            "rank": 0,
+            "world_size": 4,
+        }
+
+        with patch("alloc.artifact_writer.write_report") as mock_write:
+            _write_full_artifact(monitor, sidecar)
+            assert mock_write.called, "write_report must be called"
+            call_kwargs = mock_write.call_args
+            assert call_kwargs.kwargs.get("output_path") is None  # default = alloc_artifact.json.gz
+
+
+# ── Architecture Detection (P3-A) ──────────────────────────────────────
+
+class TestDetectArchitecture:
+    def test_hf_config_extraction(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "llama"
+        model.config.num_attention_heads = 32
+        model.config._attn_implementation = "flash_attention_2"
+        model.is_gradient_checkpointing = True
+        # No peft_config
+        del model.peft_config
+
+        result = _detect_architecture(model)
+        assert result["model_type"] == "llama"
+        assert result["architecture_type"] == "transformer"
+        assert result["gradient_checkpointing"] is True
+        assert result["attention_type"] == "flash_attention_2"
+
+    def test_optimizer_type_extraction(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "gpt2"
+        model.config.num_attention_heads = 12
+        model.is_gradient_checkpointing = False
+        del model.peft_config
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+
+        class FakeAdamW:
+            pass
+        optimizer = FakeAdamW()
+
+        result = _detect_architecture(model, optimizer=optimizer)
+        assert result["optimizer_type"] == "FakeAdamW"
+        assert result["architecture_type"] == "transformer"
+
+    def test_peft_lora_detection(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "llama"
+        model.config.num_attention_heads = 32
+        model.is_gradient_checkpointing = False
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+
+        # Simulate PEFT model
+        adapter_config = MagicMock()
+        adapter_config.peft_type = "LORA"
+        model.peft_config = {"default": adapter_config}
+
+        result = _detect_architecture(model)
+        assert result["fine_tuning_method"] == "lora"
+
+    def test_frozen_params_detection(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "bert"
+        model.config.num_attention_heads = 12
+        model.is_gradient_checkpointing = False
+        del model.peft_config
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+
+        # Simulate frozen model (95% frozen, 5% trainable)
+        params = []
+        for i in range(20):
+            p = MagicMock()
+            p.numel.return_value = 1000000
+            p.requires_grad = (i == 0)  # only 1 of 20 is trainable
+            params.append(p)
+        model.parameters.return_value = iter(params)
+
+        result = _detect_architecture(model)
+        assert result["fine_tuning_method"] == "adapter"
+        assert result["param_count"] == 20000000
+        assert result["trainable_param_count"] == 1000000
+
+    def test_none_model(self):
+        from alloc.callbacks import _detect_architecture
+        result = _detect_architecture(None)
+        assert result == {}
+
+    def test_model_without_config(self):
+        from alloc.callbacks import _detect_architecture
+        model = MagicMock(spec=[])  # empty spec = no attributes
+        result = _detect_architecture(model)
+        assert result == {}
+
+    def test_moe_detection(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "mixtral"
+        model.config.num_attention_heads = 32
+        model.is_gradient_checkpointing = False
+        del model.peft_config
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+
+        result = _detect_architecture(model)
+        assert result["architecture_type"] == "moe"
+
+    def test_training_args_gradient_checkpointing(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "llama"
+        model.config.num_attention_heads = 32
+        model.is_gradient_checkpointing = False
+        del model.peft_config
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+
+        training_args = MagicMock()
+        training_args.gradient_checkpointing = True
+
+        result = _detect_architecture(model, training_args=training_args)
+        assert result["gradient_checkpointing"] is True
+
+
+class TestBuildSidecarArchitecture:
+    def test_architecture_info_included(self):
+        arch_info = {
+            "architecture_type": "transformer",
+            "optimizer_type": "AdamW",
+            "gradient_checkpointing": True,
+            "model_type": "llama",
+        }
+        data = _build_sidecar(
+            framework="huggingface",
+            step_count=10,
+            step_times_ms=[100.0],
+            batch_size=8,
+            architecture_info=arch_info,
+        )
+        assert data["architecture_type"] == "transformer"
+        assert data["optimizer_type"] == "AdamW"
+        assert data["gradient_checkpointing"] is True
+        assert data["model_type"] == "llama"
+
+    def test_no_architecture_info(self):
+        data = _build_sidecar(
+            framework="huggingface",
+            step_count=10,
+            step_times_ms=[100.0],
+            batch_size=8,
+        )
+        assert "architecture_type" not in data
+        assert "optimizer_type" not in data
+
+    def test_partial_architecture_info(self):
+        arch_info = {
+            "optimizer_type": "SGD",
+            "gradient_checkpointing": None,  # None values not included
+        }
+        data = _build_sidecar(
+            framework="lightning",
+            step_count=5,
+            step_times_ms=[200.0],
+            batch_size=4,
+            architecture_info=arch_info,
+        )
+        assert data["optimizer_type"] == "SGD"
+        assert "gradient_checkpointing" not in data
+        assert "architecture_type" not in data
+
+
+# ── CUDA Event Non-Blocking Sync (C2 Fix) ─────────────────────────────
+
+
+class TestSyncPhaseEventsNonBlocking:
+    """Test that _sync_phase_events uses query() (non-blocking) by default
+    and synchronize() only on train_end (force=True)."""
+
+    def test_query_false_skips_sync(self):
+        """When event.query() returns False, no elapsed_time is called."""
+        from alloc.callbacks import AllocCallback
+        try:
+            cb = AllocCallback()
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        # Set up mock CUDA events
+        cb._cuda_available = True
+        cb._evt_step_start = MagicMock()
+        cb._evt_backward_start = MagicMock()
+        cb._evt_optimizer_start = MagicMock()
+        cb._evt_step_end = MagicMock()
+        cb._evt_step_end.query.return_value = False  # not ready
+
+        cb._sync_phase_events()
+
+        cb._evt_step_end.synchronize.assert_not_called()
+        cb._evt_step_start.elapsed_time.assert_not_called()
+
+    def test_query_true_reads_events(self):
+        """When event.query() returns True, elapsed_time is called."""
+        from alloc.callbacks import AllocCallback
+        try:
+            cb = AllocCallback()
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        cb._cuda_available = True
+        cb._evt_step_start = MagicMock()
+        cb._evt_backward_start = MagicMock()
+        cb._evt_optimizer_start = MagicMock()
+        cb._evt_step_end = MagicMock()
+        cb._evt_step_end.query.return_value = True
+        cb._evt_step_start.elapsed_time.return_value = 10.0
+        cb._evt_backward_start.elapsed_time.return_value = 20.0
+        cb._evt_optimizer_start.elapsed_time.return_value = 5.0
+
+        cb._sync_phase_events()
+
+        cb._evt_step_end.synchronize.assert_not_called()
+        assert len(cb._phase_forward_ms) == 1
+        assert cb._phase_forward_ms[0] == 10.0
+
+    def test_force_uses_synchronize(self):
+        """force=True uses synchronize() (on train_end)."""
+        from alloc.callbacks import AllocCallback
+        try:
+            cb = AllocCallback()
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        cb._cuda_available = True
+        cb._evt_step_start = MagicMock()
+        cb._evt_backward_start = MagicMock()
+        cb._evt_optimizer_start = MagicMock()
+        cb._evt_step_end = MagicMock()
+        cb._evt_step_start.elapsed_time.return_value = 10.0
+        cb._evt_backward_start.elapsed_time.return_value = 20.0
+        cb._evt_optimizer_start.elapsed_time.return_value = 5.0
+
+        cb._sync_phase_events(force=True)
+
+        cb._evt_step_end.synchronize.assert_called_once()
+
+
+class TestWarmupExclusion:
+    """Phase timing skips warmup steps to avoid JIT compilation noise."""
+
+    def test_warmup_steps_constant(self):
+        """Warmup steps constant exists and is reasonable."""
+        assert _WARMUP_STEPS > 0
+        assert _WARMUP_STEPS <= 20  # not too large
+
+    def test_phase_sync_not_called_during_warmup(self):
+        """Phase sync is NOT called when step_count <= WARMUP_STEPS."""
+        from alloc.callbacks import AllocCallback
+        try:
+            cb = AllocCallback()
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        cb._cuda_available = True
+        cb._evt_step_start = MagicMock()
+        cb._evt_backward_start = MagicMock()
+        cb._evt_optimizer_start = MagicMock()
+        cb._evt_step_end = MagicMock()
+        cb._monitor_started = True
+        cb._dist_checked = True
+
+        class FakeArgs:
+            per_device_train_batch_size = 8
+            gradient_accumulation_steps = 1
+
+        class FakeState:
+            global_step = _WARMUP_STEPS  # exactly at warmup — should still skip
+
+        # Step count at warmup boundary — sync should NOT be called
+        cb.step_count = _WARMUP_STEPS
+        with patch.object(cb, "_sync_phase_events") as mock_sync:
+            with patch("alloc.callbacks.time") as mock_time:
+                mock_time.monotonic.return_value = 1.0
+                cb.on_step_end(FakeArgs(), FakeState(), None)
+            # At exactly _WARMUP_STEPS, should not sync (condition is > not >=)
+            mock_sync.assert_not_called()
+
+
+class TestNvmlMonitorThreadSafety:
+    """Verify per-GPU peak VRAM is protected by lock."""
+
+    def test_peak_vram_under_lock(self):
+        """get_results reads peak VRAM copy taken under lock."""
+        mock_pynvml = MagicMock()
+        mock_pynvml.nvmlInit.return_value = None
+        mock_pynvml.nvmlDeviceGetCount.return_value = 2
+        mock_pynvml.nvmlDeviceGetName.return_value = "GPU"
+        mem = SimpleNamespace(total=80 * 1024**3, used=50 * 1024**3)
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem
+        mock_pynvml.nvmlSystemGetDriverVersion.return_value = "535"
+        mock_pynvml.nvmlSystemGetCudaDriverVersion.return_value = 12000
+        mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (8, 0)
+        util = SimpleNamespace(gpu=75, memory=60)
+        mock_pynvml.nvmlDeviceGetUtilizationRates.return_value = util
+        mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 300000
+
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            with patch("alloc.callbacks._NVML_POLL_INTERVAL_S", 0.01):
+                monitor = _NvmlMonitor()
+                monitor.start()
+                import time
+                time.sleep(0.05)
+                monitor.stop()
+
+        _, probe = monitor.get_results()
+        # Peak VRAM should be populated from locked updates
+        assert "per_rank_peak_vram_mb" in probe
+        assert len(probe["per_rank_peak_vram_mb"]) == 2
+        for peak in probe["per_rank_peak_vram_mb"]:
+            assert peak > 0

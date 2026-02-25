@@ -59,9 +59,21 @@ KNOWN_MODELS: Dict[str, int] = {
     "t5-large": int(770e6),
     "google/t5-xl-lm-adapt": int(3e9),
     "google/t5-xxl-lm-adapt": int(11e9),
-    # Vision
+    # Vision — ViT
     "google/vit-base-patch16-224": int(86e6),
     "google/vit-large-patch16-224": int(307e6),
+    # Vision — ResNet / ConvNets
+    "microsoft/resnet-50": int(25.6e6),
+    "microsoft/resnet-101": int(44.5e6),
+    "microsoft/resnet-152": int(60.2e6),
+    # Vision — CLIP
+    "openai/clip-vit-base-patch32": int(151e6),
+    "openai/clip-vit-large-patch14": int(428e6),
+    # Vision — DINOv2
+    "facebook/dinov2-base": int(86e6),
+    "facebook/dinov2-large": int(307e6),
+    # Diffusion — Stable Diffusion (UNet component)
+    "stabilityai/stable-diffusion-2-1": int(865e6),
     # Whisper
     "openai/whisper-small": int(244e6),
     "openai/whisper-medium": int(769e6),
@@ -110,9 +122,21 @@ _CLI_MODEL_PARAMS: Dict[str, float] = {
     # DeepSeek
     "deepseek-7b": 6.9,
     "deepseek-67b": 67.0,
-    # Vision
+    # Vision — ViT
     "vit-base": 0.086,
     "vit-large": 0.307,
+    # Vision — ResNet / ConvNets
+    "resnet-50": 0.026,
+    "resnet-101": 0.045,
+    "resnet-152": 0.060,
+    # Vision — CLIP
+    "clip-vit-base": 0.151,
+    "clip-vit-large": 0.428,
+    # Vision — DINOv2
+    "dinov2-base": 0.086,
+    "dinov2-large": 0.307,
+    # Diffusion
+    "stable-diffusion-2": 0.865,
     # Whisper
     "whisper-small": 0.244,
     "whisper-medium": 0.769,

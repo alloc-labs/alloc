@@ -5,8 +5,19 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import tempfile
 
-from alloc.artifact_loader import ArtifactData, load_artifact, find_artifact, _detect_oom
+import pytest
+
+from alloc.artifact_loader import (
+    ArtifactData,
+    load_artifact,
+    find_artifact,
+    find_rank_artifacts,
+    merge_artifacts,
+    _detect_oom,
+    _parse_artifact,
+)
 
 
 def _write_artifact(path, data):
@@ -249,3 +260,280 @@ def test_detect_oom_no_vram_data():
     """Non-zero exit but no VRAM data — can't confirm OOM."""
     data = ArtifactData(exit_code=-9)
     assert _detect_oom(data) is False
+
+
+# ---------------------------------------------------------------------------
+# Phase timing fields — _parse_artifact
+# ---------------------------------------------------------------------------
+
+class TestPhaseTimingFields:
+    def test_phase_timing_parsed_from_probe(self):
+        raw = {
+            "probe": {
+                "has_phase_timing": True,
+                "phase_forward_ms_p50": 40.0,
+                "phase_forward_ms_p90": 45.0,
+                "phase_backward_ms_p50": 35.0,
+                "phase_backward_ms_p90": 40.0,
+                "phase_optimizer_ms_p50": 15.0,
+                "phase_optimizer_ms_p90": 18.0,
+                "phase_dataloader_ms_p50": 10.0,
+                "phase_dataloader_ms_p90": 12.0,
+            }
+        }
+        data = _parse_artifact(raw)
+        assert data.has_phase_timing is True
+        assert data.phase_forward_ms_p50 == 40.0
+        assert data.phase_forward_ms_p90 == 45.0
+        assert data.phase_backward_ms_p50 == 35.0
+        assert data.phase_optimizer_ms_p50 == 15.0
+        assert data.phase_dataloader_ms_p50 == 10.0
+
+    def test_no_phase_timing(self):
+        raw = {"probe": {"peak_vram_mb": 1000}}
+        data = _parse_artifact(raw)
+        assert data.has_phase_timing is False
+        assert data.phase_forward_ms_p50 is None
+
+    def test_step_times_raw_parsed(self):
+        raw = {"probe": {"step_times_raw": [100.0, 110.0, 105.0]}}
+        data = _parse_artifact(raw)
+        assert data.step_times_ms == [100.0, 110.0, 105.0]
+
+
+# ---------------------------------------------------------------------------
+# Architecture metadata fields — _parse_artifact
+# ---------------------------------------------------------------------------
+
+class TestArchitectureMetadataFields:
+    def test_architecture_fields_parsed(self):
+        raw = {
+            "probe": {
+                "architecture_type": "transformer",
+                "optimizer_type": "AdamW",
+                "fine_tuning_method": "lora",
+                "gradient_checkpointing": True,
+                "attention_type": "flash_attention_2",
+                "param_count": 7000000000,
+                "trainable_param_count": 4200000,
+            }
+        }
+        data = _parse_artifact(raw)
+        assert data.architecture_type == "transformer"
+        assert data.optimizer_type == "AdamW"
+        assert data.fine_tuning_method == "lora"
+        assert data.gradient_checkpointing is True
+        assert data.attention_type == "flash_attention_2"
+        assert data.param_count == 7000000000
+        assert data.trainable_param_count == 4200000
+
+    def test_no_architecture_fields(self):
+        raw = {"probe": {"peak_vram_mb": 1000}}
+        data = _parse_artifact(raw)
+        assert data.architecture_type is None
+        assert data.optimizer_type is None
+        assert data.fine_tuning_method is None
+        assert data.gradient_checkpointing is None
+        assert data.param_count is None
+
+    def test_partial_architecture_fields(self):
+        raw = {
+            "probe": {
+                "architecture_type": "moe",
+                "optimizer_type": "SGD",
+            }
+        }
+        data = _parse_artifact(raw)
+        assert data.architecture_type == "moe"
+        assert data.optimizer_type == "SGD"
+        assert data.fine_tuning_method is None
+        assert data.gradient_checkpointing is None
+
+    def test_architecture_roundtrip_gz(self, tmp_path):
+        """Full roundtrip: write artifact with arch fields, load, verify."""
+        artifact = {
+            "probe": {
+                "peak_vram_mb": 30000,
+                "exit_code": 0,
+                "architecture_type": "transformer",
+                "optimizer_type": "AdamW",
+                "fine_tuning_method": "lora",
+                "gradient_checkpointing": True,
+                "attention_type": "sdpa",
+                "param_count": 7000000000,
+                "trainable_param_count": 4200000,
+            },
+            "hardware": {"gpu_name": "NVIDIA A100"},
+            "context": {},
+        }
+        path = str(tmp_path / "alloc_artifact.json.gz")
+        _write_artifact(path, artifact)
+        data = load_artifact(path)
+        assert data is not None
+        assert data.architecture_type == "transformer"
+        assert data.optimizer_type == "AdamW"
+        assert data.fine_tuning_method == "lora"
+        assert data.gradient_checkpointing is True
+        assert data.attention_type == "sdpa"
+        assert data.param_count == 7000000000
+        assert data.trainable_param_count == 4200000
+
+
+# ---------------------------------------------------------------------------
+# find_rank_artifacts
+# ---------------------------------------------------------------------------
+
+class TestFindRankArtifacts:
+    def test_finds_rank_files(self, tmp_path):
+        # Create fake rank artifacts
+        for i in range(4):
+            path = tmp_path / f"alloc_artifact_rank{i}.json.gz"
+            with gzip.open(str(path), "wt") as f:
+                json.dump({"probe": {"rank": i}}, f)
+
+        found = find_rank_artifacts(str(tmp_path))
+        assert len(found) == 4
+        assert "rank0" in found[0]
+        assert "rank3" in found[3]
+
+    def test_empty_directory(self, tmp_path):
+        found = find_rank_artifacts(str(tmp_path))
+        assert found == []
+
+
+# ---------------------------------------------------------------------------
+# merge_artifacts
+# ---------------------------------------------------------------------------
+
+class TestMergeArtifacts:
+    def _write_rank_artifact(self, path, rank, peak_vram, step_p50, step_times=None):
+        probe = {
+            "peak_vram_mb": peak_vram,
+            "avg_gpu_util": 70.0 + rank,
+            "step_time_ms_p50": step_p50,
+            "step_time_ms_p90": step_p50 * 1.2,
+            "gpu_name": "NVIDIA A100",
+            "gpu_total_vram_mb": 81920,
+            "num_gpus_detected": 1,
+            "rank": rank,
+        }
+        if step_times:
+            probe["step_times_raw"] = step_times
+        with gzip.open(path, "wt") as f:
+            json.dump({"probe": probe, "hardware": {"gpu_name": "NVIDIA A100"}}, f)
+
+    def test_merge_4_ranks(self, tmp_path):
+        paths = []
+        for i in range(4):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            self._write_rank_artifact(p, i, 30000 + i * 1000, 100.0 + i * 5)
+            paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged is not None
+        assert merged.gpu_count == 4
+        assert merged.gpu_name == "NVIDIA A100"
+        assert merged.peak_vram_mb == 33000  # max of ranks
+        assert len(merged.per_rank_peak_vram_mb) == 4
+
+    def test_straggler_detection(self, tmp_path):
+        paths = []
+        # Rank 0-2: 100ms, Rank 3: 150ms (straggler)
+        for i in range(3):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            self._write_rank_artifact(p, i, 30000, 100.0)
+            paths.append(p)
+        p = str(tmp_path / "rank3.json.gz")
+        self._write_rank_artifact(p, 3, 30000, 150.0)
+        paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged is not None
+        assert merged.straggler_ratio is not None
+        assert merged.straggler_ratio == 1.5  # 150/100
+
+    def test_no_straggler(self, tmp_path):
+        paths = []
+        for i in range(4):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            self._write_rank_artifact(p, i, 30000, 100.0)
+            paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged is not None
+        assert merged.straggler_ratio == 1.0
+
+    def test_merge_with_step_times(self, tmp_path):
+        paths = []
+        for i in range(2):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            self._write_rank_artifact(p, i, 30000, 100.0, step_times=[95.0, 100.0, 105.0])
+            paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged is not None
+        assert merged.per_rank_step_times_ms is not None
+        assert len(merged.per_rank_step_times_ms) == 2
+
+    def test_merge_empty_list(self):
+        result = merge_artifacts([])
+        assert result is None
+
+    def test_merge_invalid_files(self, tmp_path):
+        p = str(tmp_path / "bad.json.gz")
+        with open(p, "w") as f:
+            f.write("not valid")
+        result = merge_artifacts([p])
+        assert result is None
+
+    def test_merge_preserves_phase_timing(self, tmp_path):
+        """Phase timing from rank 0 should be preserved in merged artifact."""
+        probe = {
+            "peak_vram_mb": 30000,
+            "step_time_ms_p50": 100.0,
+            "has_phase_timing": True,
+            "phase_forward_ms_p50": 40.0,
+            "phase_backward_ms_p50": 35.0,
+            "gpu_name": "NVIDIA A100",
+        }
+        paths = []
+        for i in range(2):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            with gzip.open(p, "wt") as f:
+                json.dump({"probe": {**probe, "rank": i}}, f)
+            paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged.has_phase_timing is True
+        assert merged.phase_forward_ms_p50 == 40.0
+        assert merged.phase_backward_ms_p50 == 35.0
+
+    def test_merge_preserves_architecture_metadata(self, tmp_path):
+        """Architecture metadata from rank 0 should be preserved in merged artifact."""
+        probe = {
+            "peak_vram_mb": 30000,
+            "step_time_ms_p50": 100.0,
+            "gpu_name": "NVIDIA A100",
+            "architecture_type": "transformer",
+            "optimizer_type": "AdamW",
+            "fine_tuning_method": "lora",
+            "gradient_checkpointing": True,
+            "attention_type": "flash_attention_2",
+            "param_count": 7000000000,
+            "trainable_param_count": 4200000,
+        }
+        paths = []
+        for i in range(2):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            with gzip.open(p, "wt") as f:
+                json.dump({"probe": {**probe, "rank": i}}, f)
+            paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged.architecture_type == "transformer"
+        assert merged.optimizer_type == "AdamW"
+        assert merged.fine_tuning_method == "lora"
+        assert merged.gradient_checkpointing is True
+        assert merged.attention_type == "flash_attention_2"
+        assert merged.param_count == 7000000000
+        assert merged.trainable_param_count == 4200000

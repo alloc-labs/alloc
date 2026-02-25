@@ -37,9 +37,30 @@ class ArtifactData:
     throughput_samples_per_sec: Optional[float] = None
     dataloader_wait_pct: Optional[float] = None
 
+    # Phase timing (from callbacks with CUDA events)
+    phase_forward_ms_p50: Optional[float] = None
+    phase_forward_ms_p90: Optional[float] = None
+    phase_backward_ms_p50: Optional[float] = None
+    phase_backward_ms_p90: Optional[float] = None
+    phase_optimizer_ms_p50: Optional[float] = None
+    phase_optimizer_ms_p90: Optional[float] = None
+    phase_dataloader_ms_p50: Optional[float] = None
+    phase_dataloader_ms_p90: Optional[float] = None
+    has_phase_timing: bool = False
+
     # Per-rank data (from distributed callbacks)
     per_rank_peak_vram_mb: Optional[List[float]] = None
     per_rank_step_times_ms: Optional[List[List[float]]] = None
+    straggler_ratio: Optional[float] = None
+
+    # Architecture metadata (from callback introspection)
+    architecture_type: Optional[str] = None
+    optimizer_type: Optional[str] = None
+    fine_tuning_method: Optional[str] = None
+    gradient_checkpointing: Optional[bool] = None
+    attention_type: Optional[str] = None
+    param_count: Optional[int] = None
+    trainable_param_count: Optional[int] = None
 
     # Run metadata
     exit_code: Optional[int] = None
@@ -138,6 +159,34 @@ def _parse_artifact(raw: dict) -> ArtifactData:
     data.throughput_samples_per_sec = _float_or_none(probe.get("samples_per_sec"))
     data.dataloader_wait_pct = _float_or_none(probe.get("dataloader_wait_pct"))
 
+    # Phase timing (from CUDA events in callbacks)
+    data.phase_forward_ms_p50 = _float_or_none(probe.get("phase_forward_ms_p50"))
+    data.phase_forward_ms_p90 = _float_or_none(probe.get("phase_forward_ms_p90"))
+    data.phase_backward_ms_p50 = _float_or_none(probe.get("phase_backward_ms_p50"))
+    data.phase_backward_ms_p90 = _float_or_none(probe.get("phase_backward_ms_p90"))
+    data.phase_optimizer_ms_p50 = _float_or_none(probe.get("phase_optimizer_ms_p50"))
+    data.phase_optimizer_ms_p90 = _float_or_none(probe.get("phase_optimizer_ms_p90"))
+    data.phase_dataloader_ms_p50 = _float_or_none(probe.get("phase_dataloader_ms_p50"))
+    data.phase_dataloader_ms_p90 = _float_or_none(probe.get("phase_dataloader_ms_p90"))
+    data.has_phase_timing = bool(probe.get("has_phase_timing"))
+
+    # Architecture metadata (from callback introspection)
+    data.architecture_type = probe.get("architecture_type")
+    data.optimizer_type = probe.get("optimizer_type")
+    data.fine_tuning_method = probe.get("fine_tuning_method")
+    gc = probe.get("gradient_checkpointing")
+    data.gradient_checkpointing = bool(gc) if gc is not None else None
+    data.attention_type = probe.get("attention_type")
+    pc = probe.get("param_count")
+    data.param_count = int(pc) if pc is not None else None
+    tpc = probe.get("trainable_param_count")
+    data.trainable_param_count = int(tpc) if tpc is not None else None
+
+    # Raw step times (for per-rank merge / straggler detection)
+    raw_times = probe.get("step_times_raw")
+    if isinstance(raw_times, list) and raw_times:
+        data.step_times_ms = [float(t) for t in raw_times if t is not None]
+
     # Run metadata
     data.exit_code = probe.get("exit_code")
     data.duration_s = _float_or_none(probe.get("duration_seconds"))
@@ -177,3 +226,107 @@ def _float_or_none(val) -> Optional[float]:
         return float(val)
     except (ValueError, TypeError):
         return None
+
+
+def _percentile(values: List[float], pct: float) -> float:
+    """Compute a percentile from an unsorted list."""
+    if not values:
+        return 0.0
+    import math
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    k = (pct / 100.0) * (n - 1)
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_vals[int(k)]
+    return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
+
+
+def find_rank_artifacts(directory: str = ".") -> List[str]:
+    """Find all alloc_artifact_rank*.json.gz files in directory."""
+    pattern = os.path.join(directory, "alloc_artifact_rank*.json.gz")
+    return sorted(glob.glob(pattern))
+
+
+def merge_artifacts(paths: List[str]) -> Optional[ArtifactData]:
+    """Load multiple rank artifacts and merge into a single ArtifactData.
+
+    Combines per-rank VRAM peaks, step times, and computes straggler metrics.
+    Returns None if no valid artifacts found.
+    """
+    artifacts = [load_artifact(p) for p in paths]
+    artifacts = [a for a in artifacts if a is not None]
+    if not artifacts:
+        return None
+
+    merged = ArtifactData()
+
+    # Use GPU info from rank 0
+    merged.gpu_name = artifacts[0].gpu_name
+    merged.gpu_count = len(artifacts)
+    merged.per_gpu_vram_total_mb = artifacts[0].per_gpu_vram_total_mb
+    merged.sm_version = artifacts[0].sm_version
+    merged.interconnect = artifacts[0].interconnect
+
+    # Per-rank peak VRAM
+    peaks = [a.peak_vram_mb for a in artifacts if a.peak_vram_mb is not None]
+    if peaks:
+        merged.per_rank_peak_vram_mb = peaks
+        merged.peak_vram_mb = max(peaks)
+        merged.per_gpu_vram_used_mb = peaks
+
+    # Per-rank step times (raw lists from each rank's rolling window)
+    rank_step_times = []
+    for a in artifacts:
+        if a.step_times_ms:
+            rank_step_times.append(a.step_times_ms)
+    if rank_step_times:
+        merged.per_rank_step_times_ms = rank_step_times
+
+    # Aggregate step timing from rank 0 (representative)
+    merged.step_time_p50_ms = artifacts[0].step_time_p50_ms
+    merged.step_time_p90_ms = artifacts[0].step_time_p90_ms
+    merged.throughput_samples_per_sec = artifacts[0].throughput_samples_per_sec
+
+    # Phase timing from rank 0 (representative)
+    merged.has_phase_timing = artifacts[0].has_phase_timing
+    merged.phase_forward_ms_p50 = artifacts[0].phase_forward_ms_p50
+    merged.phase_forward_ms_p90 = artifacts[0].phase_forward_ms_p90
+    merged.phase_backward_ms_p50 = artifacts[0].phase_backward_ms_p50
+    merged.phase_backward_ms_p90 = artifacts[0].phase_backward_ms_p90
+    merged.phase_optimizer_ms_p50 = artifacts[0].phase_optimizer_ms_p50
+    merged.phase_optimizer_ms_p90 = artifacts[0].phase_optimizer_ms_p90
+    merged.phase_dataloader_ms_p50 = artifacts[0].phase_dataloader_ms_p50
+    merged.phase_dataloader_ms_p90 = artifacts[0].phase_dataloader_ms_p90
+
+    # Straggler detection: ratio of slowest to fastest rank by step time p50
+    p50s = [a.step_time_p50_ms for a in artifacts if a.step_time_p50_ms is not None]
+    if p50s and len(p50s) > 1 and min(p50s) > 0:
+        merged.straggler_ratio = round(max(p50s) / min(p50s), 3)
+
+    # Aggregate GPU util from all ranks
+    all_utils = []
+    for a in artifacts:
+        if a.avg_gpu_util is not None:
+            all_utils.append(a.avg_gpu_util)
+    if all_utils:
+        merged.avg_gpu_util = sum(all_utils) / len(all_utils)
+
+    # Architecture metadata from rank 0
+    merged.architecture_type = artifacts[0].architecture_type
+    merged.optimizer_type = artifacts[0].optimizer_type
+    merged.fine_tuning_method = artifacts[0].fine_tuning_method
+    merged.gradient_checkpointing = artifacts[0].gradient_checkpointing
+    merged.attention_type = artifacts[0].attention_type
+    merged.param_count = artifacts[0].param_count
+    merged.trainable_param_count = artifacts[0].trainable_param_count
+
+    # Run metadata from rank 0
+    merged.exit_code = artifacts[0].exit_code
+    merged.duration_s = artifacts[0].duration_s
+    merged.command = artifacts[0].command
+    merged.git_sha = artifacts[0].git_sha
+    merged.is_oom = any(a.is_oom for a in artifacts)
+
+    return merged

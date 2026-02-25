@@ -68,6 +68,13 @@ class ModelFinding:
 
 
 @dataclass
+class FineTuningFinding:
+    location: SourceLocation
+    method: str  # "lora", "qlora", "peft_generic", "adapter"
+    details: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class CodeFindings:
     script_path: str
     dataloaders: List[DataLoaderFinding] = field(default_factory=list)
@@ -75,8 +82,10 @@ class CodeFindings:
     precision: List[PrecisionFinding] = field(default_factory=list)
     distributed: List[DistributedFinding] = field(default_factory=list)
     models: List[ModelFinding] = field(default_factory=list)
+    fine_tuning: List[FineTuningFinding] = field(default_factory=list)
     imports: Dict[str, str] = field(default_factory=dict)
     has_training_loop: bool = False
+    has_gradient_checkpointing: bool = False
     gradient_accumulation_steps: Optional[int] = None
     parse_errors: List[str] = field(default_factory=list)
 
@@ -110,8 +119,12 @@ def analyze_script(script_path: str) -> CodeFindings:
     findings.precision = _find_precision(tree, findings.imports, lines, script_path)
     findings.distributed = _find_distributed(tree, findings.imports, lines, script_path)
     findings.models = _find_models(tree, findings.imports, lines, script_path)
+    findings.fine_tuning = _find_fine_tuning(tree, findings.imports, lines, script_path)
     _extract_training_args(tree, findings, lines, script_path)
     findings.has_training_loop = _detect_training_loop(tree, findings)
+    findings.has_gradient_checkpointing = any(
+        m.kind == "gradient_checkpointing" for m in findings.models
+    )
 
     # Follow local imports one level deep
     _follow_local_imports(tree, findings, script_path)
@@ -313,6 +326,16 @@ _OPTIMIZER_NAMES = {
     "torch.optim.SGD": "SGD",
     "torch.optim.RMSprop": "RMSprop",
     "torch.optim.Adagrad": "Adagrad",
+    # Extended optimizer detection
+    "lion_pytorch.Lion": "Lion",
+    "transformers.optimization.Adafactor": "Adafactor",
+    "torch.optim.LBFGS": "LBFGS",
+    "bitsandbytes.optim.Adam8bit": "Adam8bit",
+    "bitsandbytes.optim.AdamW8bit": "AdamW8bit",
+    "apex.optimizers.FusedAdam": "FusedAdam",
+    "apex.optimizers.FusedLAMB": "FusedLAMB",
+    "deepspeed.ops.adam.FusedAdam": "FusedAdam",
+    "deepspeed.ops.adam.DeepSpeedCPUAdam": "DeepSpeedCPUAdam",
 }
 
 
@@ -592,6 +615,15 @@ def _find_models(
                 ))
                 continue
 
+            # torch.set_float32_matmul_precision
+            if fqn and "set_float32_matmul_precision" in fqn:
+                results.append(ModelFinding(
+                    location=_loc(script_path, node, lines),
+                    kind="float32_matmul_precision",
+                    model_name=None,
+                ))
+                continue
+
         # cudnn.benchmark = True (assignment)
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -620,6 +652,81 @@ def _is_cudnn_benchmark(node: ast.Attribute) -> bool:
     parts.reverse()
     full = ".".join(parts)
     return "cudnn" in full and "benchmark" in full
+
+
+# ---------------------------------------------------------------------------
+# Fine-tuning / PEFT detection
+# ---------------------------------------------------------------------------
+
+_PEFT_LORA_NAMES = {
+    "peft.LoraConfig": "lora",
+    "LoraConfig": "lora",
+    "peft.get_peft_model": "peft_generic",
+    "get_peft_model": "peft_generic",
+    "peft.AdaLoraConfig": "lora",
+    "AdaLoraConfig": "lora",
+    "peft.IA3Config": "peft_generic",
+    "IA3Config": "peft_generic",
+    "peft.PrefixTuningConfig": "adapter",
+    "PrefixTuningConfig": "adapter",
+    "peft.PromptTuningConfig": "adapter",
+    "PromptTuningConfig": "adapter",
+}
+
+_QLORA_MARKERS = {
+    "prepare_model_for_kbit_training",
+    "BitsAndBytesConfig",
+}
+
+
+def _find_fine_tuning(
+    tree: ast.AST,
+    imports: Dict[str, str],
+    lines: List[str],
+    script_path: str,
+) -> List[FineTuningFinding]:
+    """Detect LoRA, QLoRA, PEFT, and adapter patterns."""
+    results = []
+    has_qlora_marker = False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fqn = _resolve_call_name(node, imports)
+        if fqn is None:
+            continue
+
+        # Check for PEFT/LoRA config or get_peft_model
+        for known_fqn, method in _PEFT_LORA_NAMES.items():
+            if fqn == known_fqn or fqn.endswith(f".{known_fqn.split('.')[-1]}"):
+                details = {}
+                # Extract LoRA rank if available
+                r_val = _get_kwarg_constant(node, "r")
+                if r_val is not None:
+                    details["rank"] = str(r_val)
+                lora_alpha = _get_kwarg_constant(node, "lora_alpha")
+                if lora_alpha is not None:
+                    details["lora_alpha"] = str(lora_alpha)
+                results.append(FineTuningFinding(
+                    location=_loc(script_path, node, lines),
+                    method=method,
+                    details=details,
+                ))
+                break
+
+        # Check for QLoRA markers
+        for marker in _QLORA_MARKERS:
+            if fqn and (fqn == marker or fqn.endswith(f".{marker}")):
+                has_qlora_marker = True
+                break
+
+    # Upgrade lora → qlora if quantization markers found
+    if has_qlora_marker:
+        for ft in results:
+            if ft.method == "lora":
+                ft.method = "qlora"
+
+    return results
 
 
 # ---------------------------------------------------------------------------

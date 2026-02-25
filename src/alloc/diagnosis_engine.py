@@ -275,11 +275,56 @@ def _build_vram_breakdown(findings: CodeFindings, artifact: ArtifactData) -> Opt
 
 
 def _build_efficiency(artifact: ArtifactData) -> Optional[Dict]:
-    """Build step time efficiency decomposition from artifact timing data."""
+    """Build step time efficiency decomposition from artifact timing data.
+
+    When CUDA event phase timing is available (has_phase_timing=True), uses
+    definitive phase breakdown instead of estimated dataloader_wait_pct.
+    """
     p50 = artifact.step_time_p50_ms
     if p50 is None or p50 <= 0:
         return None
 
+    # Prefer CUDA event phase timing when available
+    if artifact.has_phase_timing and artifact.phase_forward_ms_p50 is not None:
+        fwd = artifact.phase_forward_ms_p50 or 0.0
+        bwd = artifact.phase_backward_ms_p50 or 0.0
+        opt = artifact.phase_optimizer_ms_p50 or 0.0
+        dl = artifact.phase_dataloader_ms_p50 or 0.0
+        total = fwd + bwd + opt + dl
+
+        if total > 0:
+            fwd_pct = (fwd / total) * 100.0
+            bwd_pct = (bwd / total) * 100.0
+            opt_pct = (opt / total) * 100.0
+            dl_pct = (dl / total) * 100.0
+
+            # Determine bottleneck from phase data
+            bottleneck = None
+            bottleneck_rule = None
+            if dl_pct > 30:
+                bottleneck = "Data loading"
+                bottleneck_rule = "DL001"
+            elif bwd_pct > 50:
+                bottleneck = "Backward pass (may include communication)"
+            elif opt_pct > 30:
+                bottleneck = "Optimizer step"
+
+            return {
+                "step_time_p50_ms": round(p50, 1),
+                "source": "cuda_events",
+                "forward_pct": round(fwd_pct, 1),
+                "forward_ms": round(fwd, 1),
+                "backward_pct": round(bwd_pct, 1),
+                "backward_ms": round(bwd, 1),
+                "optimizer_pct": round(opt_pct, 1),
+                "optimizer_ms": round(opt, 1),
+                "data_loading_pct": round(dl_pct, 1),
+                "data_loading_ms": round(dl, 1),
+                "bottleneck": bottleneck,
+                "bottleneck_rule": bottleneck_rule,
+            }
+
+    # Fallback: estimated from dataloader_wait_pct (wall-clock based)
     dl_pct = artifact.dataloader_wait_pct or 0.0
     other_pct = 0.0
     compute_pct = max(0.0, 100.0 - dl_pct - other_pct)
@@ -299,6 +344,7 @@ def _build_efficiency(artifact: ArtifactData) -> Optional[Dict]:
 
     return {
         "step_time_p50_ms": round(p50, 1),
+        "source": "wall_clock",
         "compute_pct": round(compute_pct, 1),
         "compute_ms": round(compute_ms, 1),
         "data_loading_pct": round(dl_pct, 1),
@@ -320,6 +366,7 @@ def _estimate_model_params(model_name: str) -> Optional[float]:
 
     # Common models — public knowledge
     estimates = {
+        # LLMs
         "gpt2": 0.124,
         "gpt2-medium": 0.355,
         "gpt2-large": 0.774,
@@ -338,6 +385,22 @@ def _estimate_model_params(model_name: str) -> Optional[float]:
         "t5-large": 0.770,
         "t5-3b": 3.0,
         "t5-11b": 11.0,
+        # Vision models
+        "resnet-50": 0.026,
+        "resnet-101": 0.045,
+        "resnet-152": 0.060,
+        "vit-base": 0.086,
+        "vit-large": 0.307,
+        "clip-vit-base": 0.151,
+        "clip-vit-large": 0.428,
+        "dinov2-base": 0.086,
+        "dinov2-large": 0.307,
+        # Diffusion / generative
+        "stable-diffusion": 0.865,
+        # Audio
+        "whisper-small": 0.244,
+        "whisper-medium": 0.769,
+        "whisper-large": 1.55,
     }
 
     for key, params in estimates.items():
@@ -346,10 +409,15 @@ def _estimate_model_params(model_name: str) -> Optional[float]:
 
     # Try to extract number from model name (e.g., "model-7b", "model-13b")
     import re
-    match = re.search(r"(\d+(?:\.\d+)?)\s*[bB]", name)
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[bB]\b", name)
     if match:
         try:
-            return float(match.group(1))
+            val = float(match.group(1))
+            # Filter: model param counts are typically 0.01-2000B.
+            # Numbers like 50, 101, 224 are likely layer counts or image sizes
+            # (e.g., resnet-50, efficientnet-b0).
+            if 0.01 <= val <= 2000:
+                return val
         except ValueError:
             pass
 

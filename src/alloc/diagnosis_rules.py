@@ -35,6 +35,7 @@ class Diagnosis:
     estimated_impact: str
     confidence: str          # "high" | "medium" | "low"
     doc_url: Optional[str]
+    evidence: Optional[Dict[str, str]] = None  # measured values that triggered this finding
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,7 @@ def rule_dl001_num_workers_low(
             estimated_impact="~15-25% faster data loading",
             confidence=confidence,
             doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
+            evidence={"num_workers": str(dl.num_workers), "gpu_count": str(gpu_count), "recommended": str(recommended)},
         ))
 
     return results
@@ -174,6 +176,7 @@ def rule_dl002_pin_memory(
             estimated_impact="~5-10% faster data transfer to GPU",
             confidence="medium",
             doc_url="https://pytorch.org/docs/stable/data.html#memory-pinning",
+            evidence={"pin_memory": str(dl.pin_memory), "num_workers": str(dl.num_workers)},
         ))
 
     return results
@@ -219,6 +222,7 @@ def rule_dl003_persistent_workers(
             estimated_impact="~5-15% faster epoch transitions",
             confidence="medium",
             doc_url="https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader",
+            evidence={"persistent_workers": str(dl.persistent_workers), "num_workers": str(dl.num_workers)},
         ))
 
     return results
@@ -260,6 +264,7 @@ def rule_dl004_prefetch_factor(
             estimated_impact="Minimal — documents intent, prevents surprises from default changes",
             confidence="low",
             doc_url="https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader",
+            evidence={"prefetch_factor": "None", "num_workers": str(dl.num_workers)},
         ))
 
     return results
@@ -308,6 +313,7 @@ def rule_dl005_main_thread(
             estimated_impact="~30-50% faster training with parallel data loading",
             confidence=confidence,
             doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
+            evidence={"num_workers": "0", "gpu_count": str(gpu_count), "recommended": str(recommended)},
         ))
 
     return results
@@ -350,6 +356,8 @@ def rule_mem002_no_mixed_precision(
             pass
 
     # Framework-specific suggestion: HF Trainer uses TrainingArguments
+    ev = {"sm_version": str(sm), "gpu_name": gpu_name, "bf16_supported": str(use_bf16)}
+
     if _has_hf_trainer(findings):
         dtype_flag = "bf16=True" if use_bf16 else "fp16=True"
         return [Diagnosis(
@@ -367,6 +375,7 @@ def rule_mem002_no_mixed_precision(
             estimated_impact="~30-50% memory reduction, ~20-40% speedup",
             confidence=confidence,
             doc_url="https://huggingface.co/docs/transformers/perf_train_gpu_one#fp16-training",
+            evidence=ev,
         )]
 
     dtype_suggestion = "torch.bfloat16" if use_bf16 else "torch.float16"
@@ -385,6 +394,7 @@ def rule_mem002_no_mixed_precision(
         estimated_impact="~30-50% memory reduction, ~20-40% speedup",
         confidence=confidence,
         doc_url="https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html",
+        evidence=ev,
     )]
 
 
@@ -425,6 +435,7 @@ def rule_mem005_no_torch_compile(
             estimated_impact="~10-30% speedup depending on model architecture",
             confidence="low",
             doc_url="https://huggingface.co/docs/transformers/perf_train_gpu_one#using-torchcompile",
+            evidence={"framework": "hf_trainer"},
         )]
 
     return [Diagnosis(
@@ -486,6 +497,7 @@ def rule_prec001_deprecated_autocast(
             estimated_impact="Future-proofs code, no performance change",
             confidence="high",
             doc_url="https://pytorch.org/docs/stable/amp.html",
+            evidence={"api": "torch.cuda.amp.autocast"},
         ))
 
     return results
@@ -558,6 +570,7 @@ def rule_prec002_fp16_on_ampere(
             estimated_impact="Eliminates GradScaler complexity, avoids numerical instability",
             confidence="high",
             doc_url="https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html",
+            evidence={"current_dtype": dtype or "float16", "sm_version": str(sm), "gpu_name": gpu_name},
         ))
 
     return results
@@ -602,6 +615,7 @@ def rule_dist002_single_gpu_multi_available(
         estimated_impact=f"Up to ~{min(gpu_count, 8)}x throughput (actual scaling depends on model size and communication overhead)",
         confidence="medium",
         doc_url="https://pytorch.org/tutorials/intermediate/ddp_tutorial.html",
+        evidence={"gpu_count": str(gpu_count)},
     )]
 
 
@@ -646,6 +660,7 @@ def rule_dist005_data_parallel(
             estimated_impact="~30-50% throughput improvement on multi-GPU",
             confidence="high",
             doc_url="https://pytorch.org/tutorials/intermediate/ddp_tutorial.html",
+            evidence={"current_strategy": "DataParallel"},
         ))
 
     return results
@@ -687,6 +702,7 @@ def rule_dist004_gloo_backend(
             estimated_impact="~2-10x faster collective operations",
             confidence="high",
             doc_url="https://pytorch.org/docs/stable/distributed.html#backends",
+            evidence={"backend": "gloo"},
         ))
 
     return results
@@ -726,6 +742,7 @@ def rule_thru001_cudnn_benchmark(
         estimated_impact="~5-10% speedup for models with convolutions and fixed input sizes",
         confidence="low",
         doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
+        evidence={"has_training_loop": "True"},
     )]
 
 
@@ -779,6 +796,7 @@ def rule_mem001_gradient_checkpointing(
         estimated_impact="~40% activation memory reduction, ~10-15% slower per step",
         confidence="high",
         doc_url="https://huggingface.co/docs/transformers/perf_train_gpu_one#gradient-checkpointing",
+        evidence={"vram_used_mb": str(round(max_vram_used)), "vram_total_mb": str(round(total_vram)), "vram_pct": str(vram_pct), "headroom_gb": str(headroom_gb)},
     )]
 
 
@@ -827,6 +845,10 @@ def rule_mem003_batch_increase(
     if batch_size:
         current += f", batch_size={batch_size}"
 
+    ev = {"vram_used_mb": str(round(max_vram_used)), "vram_total_mb": str(round(total_vram)), "vram_pct": str(vram_pct), "free_gb": str(free_gb)}
+    if batch_size is not None:
+        ev["batch_size"] = str(batch_size)
+
     return [Diagnosis(
         rule_id="MEM003",
         severity="info",
@@ -842,6 +864,7 @@ def rule_mem003_batch_increase(
         estimated_impact="~10-30% throughput improvement from better GPU utilization",
         confidence="medium",
         doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
+        evidence=ev,
     )]
 
 
@@ -897,6 +920,7 @@ def rule_mem004_batch_too_large(
         estimated_impact="Prevents OOM crashes during training",
         confidence="high",
         doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
+        evidence={"vram_used_mb": str(round(max_vram_used)), "vram_total_mb": str(round(total_vram)), "vram_pct": str(vram_pct), "headroom_gb": str(headroom_gb), "has_gradient_checkpointing": str(has_gc)},
     )]
 
 
@@ -952,6 +976,11 @@ def rule_dist001_consider_fsdp(
         vram_pct = round(max(artifact.per_gpu_vram_used_mb) / artifact.per_gpu_vram_total_mb * 100, 1)
         rationale += f" VRAM at {vram_pct}% — FSDP can reduce per-GPU memory by 2-4x."
 
+    ev = {"current_strategy": "DDP"}
+    if high_vram and artifact and artifact.per_gpu_vram_used_mb and artifact.per_gpu_vram_total_mb:
+        ev["vram_pct"] = str(round(max(artifact.per_gpu_vram_used_mb) / artifact.per_gpu_vram_total_mb * 100, 1))
+        ev["vram_used_mb"] = str(round(max(artifact.per_gpu_vram_used_mb)))
+
     return [Diagnosis(
         rule_id="DIST001",
         severity="info",
@@ -967,6 +996,7 @@ def rule_dist001_consider_fsdp(
         estimated_impact="~2-4x per-GPU memory reduction, enables larger models/batches",
         confidence="medium",
         doc_url="https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html",
+        evidence=ev,
     )]
 
 
@@ -1016,6 +1046,7 @@ def rule_dist003_gradient_accumulation(
         estimated_impact="~15-25% training speedup from better GPU utilization",
         confidence="medium",
         doc_url="https://huggingface.co/docs/transformers/perf_train_gpu_one#gradient-accumulation",
+        evidence={"batch_size": str(batch_size), "avg_gpu_util_pct": str(round(avg_util))},
     )]
 
 
@@ -1070,6 +1101,7 @@ def rule_thru003_reduce_grad_accum(
         estimated_impact="~10-20% throughput improvement",
         confidence="low",
         doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
+        evidence={"throughput_sps": str(round(sps, 1)), "avg_gpu_util_pct": str(round(avg_util)), "gradient_accumulation_steps": str(findings.gradient_accumulation_steps)},
     )]
 
 
@@ -1114,6 +1146,7 @@ def rule_xs004_mixed_precision_effective(
         estimated_impact="Already optimized for this aspect",
         confidence="high",
         doc_url="https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html",
+        evidence={"avg_gpu_util_pct": str(round(avg_util)), "has_autocast": "True"},
     )]
 
 
@@ -1189,6 +1222,14 @@ def _check_step_time_straggler(
     worst_rank, worst_time, worst_ratio = max(stragglers, key=lambda x: x[2])
     pct_slower = round((worst_ratio - 1.0) * 100, 0)
 
+    ev = {
+        "straggler_rank": str(worst_rank),
+        "straggler_step_time_ms": str(round(worst_time, 1)),
+        "median_step_time_ms": str(round(overall_median, 1)),
+        "pct_slower": str(round(pct_slower)),
+        "num_ranks": str(len(rank_medians)),
+    }
+
     return [Diagnosis(
         rule_id="STRAG001",
         severity="warning",
@@ -1204,6 +1245,7 @@ def _check_step_time_straggler(
         estimated_impact="Resolving straggler can improve overall throughput by ~{:.0f}%".format(min(pct_slower, 30)),
         confidence="medium",
         doc_url="https://pytorch.org/docs/stable/distributed.html",
+        evidence=ev,
     )]
 
 
@@ -1248,6 +1290,7 @@ def rule_reg001_step_time_regression(
         estimated_impact=f"Training is ~{pct_change:.0f}% slower than previous run",
         confidence="high",
         doc_url=None,
+        evidence={"prev_step_time_p50_ms": str(round(prev_p50, 1)), "cur_step_time_p50_ms": str(round(cur_p50, 1)), "pct_change": str(round(pct_change))},
     )]
 
 
@@ -1290,6 +1333,7 @@ def rule_reg002_throughput_regression(
         estimated_impact=f"Training is ~{drop:.0f}% slower than previous run",
         confidence="high",
         doc_url=None,
+        evidence={"prev_throughput_sps": str(round(prev, 1)), "cur_throughput_sps": str(round(cur, 1)), "pct_drop": str(round(drop))},
     )]
 
 
@@ -1336,6 +1380,7 @@ def rule_reg003_vram_regression(
         estimated_impact="Increased OOM risk if trend continues",
         confidence="medium",
         doc_url=None,
+        evidence={"prev_peak_vram_mb": str(round(prev)), "cur_peak_vram_mb": str(round(cur)), "pct_change": str(round(pct_change))},
     )]
 
 
@@ -1378,12 +1423,195 @@ def rule_reg004_util_regression(
         estimated_impact=f"GPU is {drop:.0f}% less utilized than previous run",
         confidence="medium",
         doc_url=None,
+        evidence={"prev_gpu_util_pct": str(round(prev)), "cur_gpu_util_pct": str(round(cur)), "drop_pp": str(round(drop))},
+    )]
+
+
+# ---------------------------------------------------------------------------
+# UPG001: Deprecated GradScaler API
+# ---------------------------------------------------------------------------
+
+def rule_upg001_deprecated_grad_scaler(
+    findings: CodeFindings,
+    hw: Optional[Dict] = None,
+) -> List[Diagnosis]:
+    """Using deprecated torch.cuda.amp.GradScaler API.
+
+    torch.cuda.amp.GradScaler is deprecated since PyTorch 2.4.
+    Use torch.amp.GradScaler("cuda") instead.
+
+    Ref: https://pytorch.org/docs/stable/amp.html#torch.amp.GradScaler
+    """
+    results = []
+    for prec in findings.precision:
+        if prec.kind != "grad_scaler" or not prec.is_deprecated_api:
+            continue
+
+        suggested_code = prec.location.source_line
+        suggested_code = suggested_code.replace(
+            "torch.cuda.amp.GradScaler", "torch.amp.GradScaler"
+        )
+        # Add "cuda" device arg if GradScaler() has no args
+        if "GradScaler()" in suggested_code:
+            suggested_code = suggested_code.replace(
+                'GradScaler()', 'GradScaler("cuda")'
+            )
+
+        results.append(Diagnosis(
+            rule_id="UPG001",
+            severity="info",
+            category="upgrade",
+            title="Deprecated GradScaler API",
+            file_path=prec.location.file_path,
+            line_number=prec.location.line_number,
+            current_code=prec.location.source_line,
+            current_value="torch.cuda.amp.GradScaler",
+            suggested_value='torch.amp.GradScaler("cuda")',
+            suggested_code=suggested_code,
+            rationale="torch.cuda.amp.GradScaler is deprecated since PyTorch 2.4. Use torch.amp.GradScaler with explicit device argument.",
+            estimated_impact="Future-proofs code — no performance change",
+            confidence="high",
+            doc_url="https://pytorch.org/docs/stable/amp.html#torch.amp.GradScaler",
+            evidence={"api": "torch.cuda.amp.GradScaler", "deprecated_since": "PyTorch 2.4"},
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# UPG002: tf32 matmul precision not set on Ampere+
+# ---------------------------------------------------------------------------
+
+def rule_upg002_tf32_matmul(
+    findings: CodeFindings,
+    hw: Optional[Dict] = None,
+) -> List[Diagnosis]:
+    """TF32 matmul precision not explicitly enabled on Ampere+ hardware.
+
+    On SM >= 8.0, torch.set_float32_matmul_precision('high') enables TF32
+    for float32 matmuls, giving ~3x speedup with minimal precision loss.
+    PyTorch 2.0+ defaults to 'highest' (no TF32) unless explicitly set.
+
+    Ref: https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    """
+    if not hw:
+        return []
+
+    sm = hw.get("sm_version", "")
+    if not sm:
+        return []
+
+    try:
+        sm_major = int(str(sm).split(".")[0])
+    except (ValueError, IndexError):
+        return []
+
+    if sm_major < 8:
+        return []
+
+    # Check if already set in code
+    for model in findings.models:
+        if model.kind == "float32_matmul_precision":
+            return []
+
+    # Check for it in distributed findings (some patterns set it there)
+    # Also check raw imports/AST for the call
+    # Actually, we need to check if set_float32_matmul_precision is called anywhere
+    for dist in findings.distributed:
+        if dist.kind == "float32_matmul_precision":
+            return []
+
+    # Only fire if there's a training loop (otherwise not relevant)
+    if not findings.has_training_loop and not any(m.kind == "from_pretrained" for m in findings.models):
+        return []
+
+    # Check if using mixed precision — TF32 still helps for fp32 operations in mixed precision
+    gpu_name = hw.get("gpu_name", "GPU")
+
+    return [Diagnosis(
+        rule_id="UPG002",
+        severity="info",
+        category="upgrade",
+        title="TF32 matmul precision not set",
+        file_path=findings.script_path,
+        line_number=0,
+        current_code="",
+        current_value="Default float32 matmul precision (highest — no TF32)",
+        suggested_value="torch.set_float32_matmul_precision('high')",
+        suggested_code="torch.set_float32_matmul_precision('high')",
+        rationale=f"{gpu_name} supports TF32 — enabling it gives ~3x float32 matmul speedup with <0.1% precision difference. Useful even with mixed precision for fp32 residual operations.",
+        estimated_impact="~10-30% speedup for fp32 operations on Ampere+ GPUs",
+        confidence="medium",
+        doc_url="https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html",
+        evidence={"sm_version": str(sm), "gpu_name": gpu_name, "feature": "TF32"},
+    )]
+
+
+# ---------------------------------------------------------------------------
+# UPG003: DeepSpeed on single node — consider native FSDP
+# ---------------------------------------------------------------------------
+
+def rule_upg003_deepspeed_single_node(
+    findings: CodeFindings,
+    hw: Optional[Dict] = None,
+) -> List[Diagnosis]:
+    """Using DeepSpeed on single-node training where native FSDP may suffice.
+
+    DeepSpeed adds complexity (config files, version pinning) that native
+    PyTorch FSDP avoids. For single-node training, FSDP provides equivalent
+    memory efficiency with fewer dependencies.
+
+    Ref: https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html
+    """
+    has_deepspeed = any(d.kind == "deepspeed" for d in findings.distributed)
+    if not has_deepspeed:
+        return []
+
+    # Already using FSDP — no need to suggest
+    has_fsdp = any(d.kind == "fsdp" for d in findings.distributed)
+    if has_fsdp:
+        return []
+
+    # Only fire for single-node — multi-node DeepSpeed has legitimate advantages
+    gpu_count = (hw or {}).get("gpu_count", 1) or 1
+    if gpu_count > 8:
+        return []  # Likely multi-node, DeepSpeed may be better
+
+    ds_finding = next(d for d in findings.distributed if d.kind == "deepspeed")
+
+    return [Diagnosis(
+        rule_id="UPG003",
+        severity="info",
+        category="upgrade",
+        title="Consider native FSDP over DeepSpeed",
+        file_path=ds_finding.location.file_path,
+        line_number=ds_finding.location.line_number,
+        current_code=ds_finding.location.source_line,
+        current_value="DeepSpeed (external dependency)",
+        suggested_value="PyTorch FSDP (native, no extra dependencies)",
+        suggested_code="# from torch.distributed.fsdp import FullyShardedDataParallel as FSDP",
+        rationale="For single-node training, native PyTorch FSDP provides equivalent memory sharding without DeepSpeed's config complexity and version pinning requirements.",
+        estimated_impact="Fewer dependencies, simpler config — equivalent performance for single-node",
+        confidence="low",
+        doc_url="https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html",
+        evidence={"current_strategy": "DeepSpeed", "gpu_count": str(gpu_count)},
     )]
 
 
 # ---------------------------------------------------------------------------
 # Rule registry
 # ---------------------------------------------------------------------------
+
+# Upgrade-related rule IDs — used by --upgrades filter
+UPGRADE_RULE_IDS = {
+    # Dedicated upgrade rules
+    "UPG001", "UPG002", "UPG003",
+    # Existing rules that detect upgrade opportunities
+    "PREC001",  # deprecated autocast API
+    "PREC002",  # fp16 → bf16 on Ampere+
+    "MEM005",   # torch.compile not used
+    "DIST005",  # DataParallel → DDP
+}
 
 ALL_RULES = [
     # Phase 1 rules (AST-only, 2-arg)
@@ -1400,6 +1628,9 @@ ALL_RULES = [
     rule_dist004_gloo_backend,
     rule_dist005_data_parallel,
     rule_thru001_cudnn_benchmark,
+    rule_upg001_deprecated_grad_scaler,
+    rule_upg002_tf32_matmul,
+    rule_upg003_deepspeed_single_node,
     # Phase 2 rules (runtime-aware, 3-arg)
     rule_mem001_gradient_checkpointing,
     rule_mem003_batch_increase,

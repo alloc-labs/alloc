@@ -45,6 +45,25 @@ def _count_params(model):
     return total, dtype_str
 
 
+def _extract_architecture(model):
+    """Extract architecture dimensions from model object."""
+    info = {}
+    config = getattr(model, "config", None)
+    if config is not None:
+        info["hidden_dim"] = getattr(config, "hidden_size", None)
+        info["num_layers"] = (
+            getattr(config, "num_hidden_layers", None)
+            or getattr(config, "num_layers", None)
+            or getattr(config, "n_layer", None)
+        )
+        info["seq_length"] = (
+            getattr(config, "max_position_embeddings", None)
+            or getattr(config, "n_positions", None)
+        )
+        info["model_type"] = getattr(config, "model_type", None)
+    return info
+
+
 def main():
     sidecar_path = sys.argv[1]
     script_path = sys.argv[2]
@@ -124,11 +143,29 @@ def main():
         # Pick largest model (most params = likely training target)
         models.sort(key=lambda m: m[0], reverse=True)
         best = models[0]
+
+        # Try to extract architecture info from the best model
+        best_model_obj = None
+        for attr_name in dir(module):
+            try:
+                obj = getattr(module, attr_name)
+                if isinstance(obj, nn.Module) and attr_name == best[2]:
+                    best_model_obj = obj
+                    break
+            except Exception:
+                continue
+
+        arch_info = _extract_architecture(best_model_obj) if best_model_obj else {}
+
         result = {
             "status": "ok",
             "param_count": best[0],
             "dtype": best[1],
             "model_name": best[2],
+            "hidden_dim": arch_info.get("hidden_dim"),
+            "num_layers": arch_info.get("num_layers"),
+            "seq_length": arch_info.get("seq_length"),
+            "model_type": arch_info.get("model_type"),
         }
     else:
         result = {"status": "no_model"}

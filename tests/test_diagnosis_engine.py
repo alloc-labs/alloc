@@ -7,7 +7,7 @@ from alloc.code_analyzer import analyze_script
 from alloc.diagnosis_engine import (
     run_diagnosis, DiagnoseResult, _deduplicate,
     _determine_tier, _build_comparison, _build_efficiency,
-    _sniff_environment,
+    _sniff_environment, _estimate_model_params,
 )
 from alloc.diagnosis_rules import Diagnosis
 
@@ -278,3 +278,39 @@ def test_sniff_environment_alloc_conf(monkeypatch):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     ctx = _sniff_environment()
     assert ctx["pytorch_cuda_alloc_conf"] == "expandable_segments:True"
+
+
+# ---------------------------------------------------------------------------
+# _estimate_model_params — architecture-agnostic fixes
+# ---------------------------------------------------------------------------
+
+def test_estimate_model_params_resnet_not_matched():
+    """resnet-50 should NOT be estimated as 50B params."""
+    result = _estimate_model_params("microsoft/resnet-50")
+    # Should match the "resnet-50" key in the estimates dict (0.026B), not the regex
+    assert result == 0.026
+
+
+def test_estimate_model_params_7b_matched():
+    """model-7b should still match as 7B params."""
+    result = _estimate_model_params("custom-model-7b")
+    assert result == 7.0
+
+
+def test_estimate_model_params_regex_filters_layer_counts():
+    """Large numbers followed by 'b' that look like layer counts should be filtered."""
+    # "efficientnet-b0" has "0b" which is too small
+    result = _estimate_model_params("efficientnet-b0")
+    assert result is None
+
+
+def test_estimate_model_params_known_vision_model():
+    """Vision models should be found in the estimates dict."""
+    result = _estimate_model_params("vit-base")
+    assert result == 0.086
+
+    result = _estimate_model_params("resnet-50")
+    assert result == 0.026
+
+    result = _estimate_model_params("stable-diffusion")
+    assert result == 0.865

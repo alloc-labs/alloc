@@ -30,6 +30,10 @@ from alloc.diagnosis_rules import (
     rule_reg002_throughput_regression,
     rule_reg003_vram_regression,
     rule_reg004_util_regression,
+    rule_upg001_deprecated_grad_scaler,
+    rule_upg002_tf32_matmul,
+    rule_upg003_deepspeed_single_node,
+    UPGRADE_RULE_IDS,
 )
 
 
@@ -867,3 +871,157 @@ def test_mem005_raw_pytorch_suggests_torch_compile(tmp_path):
     diags = rule_mem005_no_torch_compile(findings, HW_1GPU)
     assert len(diags) == 1
     assert "torch.compile" in diags[0].suggested_value
+
+
+# ---------------------------------------------------------------------------
+# UPG001: Deprecated GradScaler API
+# ---------------------------------------------------------------------------
+
+def test_upg001_fires_deprecated_grad_scaler(tmp_path):
+    """UPG001 fires on torch.cuda.amp.GradScaler."""
+    findings = _analyze(tmp_path, """
+        import torch
+        scaler = torch.cuda.amp.GradScaler()
+    """)
+    diags = rule_upg001_deprecated_grad_scaler(findings)
+    assert len(diags) == 1
+    assert diags[0].rule_id == "UPG001"
+    assert diags[0].category == "upgrade"
+    assert "torch.amp.GradScaler" in diags[0].suggested_value
+
+
+def test_upg001_ok_new_api(tmp_path):
+    """UPG001 does not fire on new torch.amp.GradScaler."""
+    findings = _analyze(tmp_path, """
+        import torch
+        scaler = torch.amp.GradScaler("cuda")
+    """)
+    diags = rule_upg001_deprecated_grad_scaler(findings)
+    assert len(diags) == 0
+
+
+def test_upg001_no_grad_scaler(tmp_path):
+    """UPG001 does not fire when no GradScaler is used."""
+    findings = _analyze(tmp_path, """
+        import torch
+        model = torch.nn.Linear(10, 10)
+    """)
+    diags = rule_upg001_deprecated_grad_scaler(findings)
+    assert len(diags) == 0
+
+
+# ---------------------------------------------------------------------------
+# UPG002: TF32 matmul precision not set
+# ---------------------------------------------------------------------------
+
+def test_upg002_fires_ampere_no_tf32(tmp_path):
+    """UPG002 fires on Ampere+ when set_float32_matmul_precision not called."""
+    findings = _analyze(tmp_path, """
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained("gpt2")
+    """)
+    diags = rule_upg002_tf32_matmul(findings, HW_H100)
+    assert len(diags) == 1
+    assert diags[0].rule_id == "UPG002"
+    assert diags[0].category == "upgrade"
+    assert "set_float32_matmul_precision" in diags[0].suggested_value
+
+
+def test_upg002_ok_already_set(tmp_path):
+    """UPG002 does not fire when set_float32_matmul_precision is already called."""
+    findings = _analyze(tmp_path, """
+        import torch
+        from transformers import AutoModelForCausalLM
+        torch.set_float32_matmul_precision("high")
+        model = AutoModelForCausalLM.from_pretrained("gpt2")
+    """)
+    diags = rule_upg002_tf32_matmul(findings, HW_H100)
+    assert len(diags) == 0
+
+
+def test_upg002_skips_v100(tmp_path):
+    """UPG002 does not fire on pre-Ampere GPUs."""
+    findings = _analyze(tmp_path, """
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained("gpt2")
+    """)
+    diags = rule_upg002_tf32_matmul(findings, HW_V100)
+    assert len(diags) == 0
+
+
+def test_upg002_skips_no_hw(tmp_path):
+    """UPG002 does not fire when no hardware context."""
+    findings = _analyze(tmp_path, """
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained("gpt2")
+    """)
+    diags = rule_upg002_tf32_matmul(findings, None)
+    assert len(diags) == 0
+
+
+# ---------------------------------------------------------------------------
+# UPG003: DeepSpeed on single node
+# ---------------------------------------------------------------------------
+
+def test_upg003_fires_deepspeed_single_node(tmp_path):
+    """UPG003 fires on DeepSpeed with <= 8 GPUs."""
+    findings = _analyze(tmp_path, """
+        import deepspeed
+        model, optimizer, _, _ = deepspeed.initialize(model=model, config="ds_config.json")
+    """)
+    diags = rule_upg003_deepspeed_single_node(findings, HW_4GPU)
+    assert len(diags) == 1
+    assert diags[0].rule_id == "UPG003"
+    assert diags[0].category == "upgrade"
+    assert "FSDP" in diags[0].suggested_value
+
+
+def test_upg003_skips_multi_node(tmp_path):
+    """UPG003 does not fire when GPU count > 8 (likely multi-node)."""
+    findings = _analyze(tmp_path, """
+        import deepspeed
+        model, optimizer, _, _ = deepspeed.initialize(model=model, config="ds_config.json")
+    """)
+    hw = {"gpu_name": "H100", "gpu_count": 16, "sm_version": "9.0"}
+    diags = rule_upg003_deepspeed_single_node(findings, hw)
+    assert len(diags) == 0
+
+
+def test_upg003_skips_no_deepspeed(tmp_path):
+    """UPG003 does not fire without DeepSpeed."""
+    findings = _analyze(tmp_path, """
+        import torch
+        model = torch.nn.Linear(10, 10)
+    """)
+    diags = rule_upg003_deepspeed_single_node(findings, HW_4GPU)
+    assert len(diags) == 0
+
+
+def test_upg003_skips_already_fsdp(tmp_path):
+    """UPG003 does not fire if FSDP is already in use alongside DeepSpeed."""
+    findings = _analyze(tmp_path, """
+        import deepspeed
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        model, optimizer, _, _ = deepspeed.initialize(model=model, config="ds_config.json")
+        model = FSDP(model)
+    """)
+    diags = rule_upg003_deepspeed_single_node(findings, HW_4GPU)
+    assert len(diags) == 0
+
+
+# ---------------------------------------------------------------------------
+# UPGRADE_RULE_IDS registry
+# ---------------------------------------------------------------------------
+
+def test_upgrade_rule_ids_contains_expected():
+    """UPGRADE_RULE_IDS contains all expected upgrade-related rules."""
+    assert "UPG001" in UPGRADE_RULE_IDS
+    assert "UPG002" in UPGRADE_RULE_IDS
+    assert "UPG003" in UPGRADE_RULE_IDS
+    assert "PREC001" in UPGRADE_RULE_IDS
+    assert "PREC002" in UPGRADE_RULE_IDS
+    assert "MEM005" in UPGRADE_RULE_IDS
+    assert "DIST005" in UPGRADE_RULE_IDS
+    # Ensure non-upgrade rules are NOT included
+    assert "DL001" not in UPGRADE_RULE_IDS
+    assert "MEM001" not in UPGRADE_RULE_IDS

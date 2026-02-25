@@ -218,9 +218,32 @@ def _build_patches(result: DiagnoseResult) -> List[str]:
 # --json mode: Machine-readable JSON
 # ---------------------------------------------------------------------------
 
-def print_diagnose_json(result: DiagnoseResult) -> None:
-    """Print diagnosis result as JSON."""
+def print_diagnose_json(
+    result: DiagnoseResult,
+    explain_data: dict = None,
+    fix_data: dict = None,
+    what_if_data: dict = None,
+    comm_data: dict = None,
+    root_cause_data: dict = None,
+    migrate_data: dict = None,
+    explore_data: dict = None,
+) -> None:
+    """Print diagnosis result as JSON. Includes AI data if provided."""
     data = build_json_dict(result)
+    if explain_data:
+        data["explain"] = explain_data
+    if fix_data:
+        data["fix"] = fix_data
+    if what_if_data:
+        data["what_if"] = what_if_data
+    if comm_data:
+        data["comm_analysis"] = comm_data
+    if root_cause_data:
+        data["root_cause"] = root_cause_data
+    if migrate_data:
+        data["migrate"] = migrate_data
+    if explore_data:
+        data["explore"] = explore_data
     print(json.dumps(data, indent=2, default=str))
 
 
@@ -244,6 +267,8 @@ def build_json_dict(result: DiagnoseResult) -> dict:
             "confidence": d.confidence,
             "doc_url": d.doc_url,
         }
+        if d.evidence:
+            finding["evidence"] = d.evidence
         findings_list.append(finding)
 
     hw = None

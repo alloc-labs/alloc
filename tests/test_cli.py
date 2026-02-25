@@ -203,3 +203,129 @@ def test_read_callback_data_returns_none(tmp_path, monkeypatch):
     """No sidecar files → None."""
     monkeypatch.chdir(tmp_path)
     assert _read_callback_data() is None
+
+
+# ---------------------------------------------------------------------------
+# alloc status tests
+# ---------------------------------------------------------------------------
+
+
+def test_status_help():
+    """alloc status --help should show options."""
+    result = runner.invoke(app, ["status", "--help"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "--json" in out
+
+
+def test_status_no_artifact(tmp_path, monkeypatch):
+    """alloc status in empty dir shows no artifact message."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "No artifact found" in out
+    assert "alloc v" in out
+
+
+def test_status_json_no_artifact(tmp_path, monkeypatch):
+    """alloc status --json in empty dir returns valid JSON with null artifact."""
+    import json
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+    result = runner.invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output.strip())
+    assert data["artifact"] is None
+    assert data["logged_in"] is False
+    assert "version" in data
+
+
+def test_status_with_artifact(tmp_path, monkeypatch):
+    """alloc status finds and displays artifact summary."""
+    import gzip
+    import json as _json
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+
+    artifact = {
+        "probe": {
+            "avg_gpu_util": 87.5,
+            "peak_vram_mb": 41000,
+            "exit_code": 0,
+            "duration_seconds": 125.4,
+            "command": "python train.py --epochs 10",
+            "samples": [
+                {"gpu_util_pct": 85, "power_w": 300},
+                {"gpu_util_pct": 90, "power_w": 310},
+            ],
+        },
+        "hardware": {
+            "gpu_name": "A100-80GB",
+            "num_gpus_detected": 2,
+        },
+    }
+    art_path = tmp_path / "alloc_artifact.json.gz"
+    with gzip.open(str(art_path), "wt", encoding="utf-8") as f:
+        _json.dump(artifact, f)
+
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "A100-80GB" in out
+    assert "2x" in out
+    assert "python train.py" in out
+
+
+def test_status_json_with_artifact(tmp_path, monkeypatch):
+    """alloc status --json with artifact returns structured data."""
+    import gzip
+    import json as _json
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+
+    artifact = {
+        "probe": {
+            "avg_gpu_util": 95,
+            "peak_vram_mb": 70000,
+            "exit_code": 0,
+            "duration_seconds": 300.0,
+            "samples": [],
+        },
+        "hardware": {
+            "gpu_name": "H100-80GB",
+            "num_gpus_detected": 8,
+        },
+    }
+    art_path = tmp_path / "alloc_artifact.json.gz"
+    with gzip.open(str(art_path), "wt", encoding="utf-8") as f:
+        _json.dump(artifact, f)
+
+    result = runner.invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    data = _json.loads(result.output.strip())
+    assert data["artifact"] is not None
+    assert data["artifact"]["gpu"] == "H100-80GB"
+    assert data["artifact"]["gpu_count"] == 8
+    assert data["artifact"]["exit_code"] == 0
+
+
+def test_status_logged_in(tmp_path, monkeypatch):
+    """alloc status with token shows logged-in state."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ALLOC_TOKEN", "test-token-123")
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "Logged in" in out
+
+
+def test_status_not_logged_in(tmp_path, monkeypatch):
+    """alloc status without token shows not-logged-in state."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "Not logged in" in out

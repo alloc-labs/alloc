@@ -5,6 +5,8 @@ Commands:
     alloc run <command...>     Wrap training with probe monitoring, write artifact
     alloc scan --model <name>  Remote ghost scan via API — no GPU needed
     alloc diagnose <script.py> Analyze training script for performance issues
+    alloc doctor <script.py>   Full training doctor — diagnose, explain, and fix
+    alloc status               Show last run summary, upload state, dashboard link
     alloc login                Authenticate with Alloc dashboard
     alloc upload <artifact>    Upload an artifact to the Alloc dashboard
     alloc version              Show version
@@ -14,7 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -37,14 +39,15 @@ console = Console()
 def ghost(
     script: str = typer.Argument(..., help="Python script to analyze (e.g. train.py)"),
     dtype: str = typer.Option("fp16", help="Data type: fp16, bf16, fp32"),
-    batch_size: int = typer.Option(32, help="Training batch size"),
-    seq_length: int = typer.Option(2048, help="Sequence length"),
-    hidden_dim: int = typer.Option(4096, help="Hidden dimension"),
+    batch_size: Optional[int] = typer.Option(None, help="Training batch size (auto-detected from model when possible)"),
+    seq_length: Optional[int] = typer.Option(None, help="Sequence length (for transformer models)"),
+    hidden_dim: Optional[int] = typer.Option(None, help="Hidden dimension (for transformer models)"),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed VRAM formula breakdown"),
     param_count_b: Optional[float] = typer.Option(None, "--param-count-b", "-p", help="Param count in billions (skip script analysis)"),
     timeout: int = typer.Option(60, "--timeout", help="Max seconds for model extraction"),
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
+    explain: bool = typer.Option(False, "--explain", help="AI-refined VRAM estimate (Pro tier, requires login)"),
 ):
     """Ghost scan — static VRAM analysis without executing the model."""
     from alloc.ghost import ghost as ghost_fn
@@ -68,22 +71,35 @@ def ghost(
     # Use dtype from execution if available, otherwise CLI flag
     resolved_dtype = info.dtype if info.method == "execution" else dtype
 
+    # Use architecture info from model extraction if user didn't provide explicit values
+    resolved_hidden_dim = hidden_dim if hidden_dim is not None else info.hidden_dim
+    resolved_seq_length = seq_length if seq_length is not None else info.seq_length
+
     report = ghost_fn(
         param_count=info.param_count,
         dtype=resolved_dtype,
         batch_size=batch_size,
-        seq_length=seq_length,
-        hidden_dim=hidden_dim,
+        seq_length=resolved_seq_length,
+        hidden_dim=resolved_hidden_dim,
     )
     report.extraction_method = info.method
+
+    # --explain: fetch AI-refined VRAM estimate
+    explain_data = None
+    if explain:
+        explain_data = _fetch_ghost_explain(report, info, batch_size, resolved_seq_length, resolved_hidden_dim, json_output)
 
     if json_output:
         data = report.to_dict()
         if gpu_context:
             data["gpu_context"] = gpu_context
+        if explain_data:
+            data["explain"] = explain_data
         _print_json(data)
     else:
         print_ghost_report(report)
+        if explain_data:
+            _render_ghost_explain_rich(explain_data)
         if gpu_context and not verbose:
             _print_gpu_context_summary(gpu_context)
         if verbose:
@@ -91,6 +107,187 @@ def ghost(
             print_verbose_ghost(report)
             if gpu_context:
                 _print_gpu_context_detail(gpu_context)
+
+
+def _fetch_ghost_explain(report, info, batch_size, seq_length, hidden_dim, json_output):
+    """Fetch AI-refined VRAM estimate from the API. Returns dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if json_output:
+            import sys
+            print('{"error": "Login required for --explain. Run: alloc login"}', file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[yellow]Login required for --explain. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+
+        # Build heuristic VRAM dict from ghost report
+        heuristic_vram = {
+            "weights_gb": report.weights_gb,
+            "gradients_gb": report.gradients_gb,
+            "optimizer_gb": report.optimizer_gb,
+            "activations_gb": report.activations_gb,
+            "buffer_gb": report.buffer_gb,
+            "total_gb": report.total_gb,
+        }
+
+        # Build unknowns list based on what we don't know
+        unknowns = []
+        if batch_size is None:
+            unknowns.append("batch_size not specified — activation estimate uses generic heuristic")
+        if seq_length is None and hidden_dim is None:
+            unknowns.append("architecture dimensions unknown — cannot use transformer-specific formula")
+        if info.method == "manual":
+            unknowns.append("param count from user input — model architecture unknown")
+
+        # Build workload context from model info
+        workload = {}
+        if info.model_name:
+            workload["model_name"] = info.model_name
+
+        payload = {
+            "heuristic_vram": heuristic_vram,
+            "param_count_b": report.param_count_b,
+            "dtype": report.dtype,
+            "extraction_method": info.method,
+            "batch_size": batch_size,
+            "seq_length": seq_length,
+            "hidden_dim": hidden_dim,
+            "num_layers": report.num_layers,
+        }
+
+        if info.model_name:
+            payload["model_name"] = info.model_name
+
+        if unknowns:
+            payload["unknowns"] = unknowns
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/ghost-explain".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if json_output:
+                    import sys
+                    print('{"error": "Pro tier required for --explain"}', file=sys.stderr)
+                else:
+                    from rich.console import Console
+                    Console(stderr=True).print("[yellow]Pro tier required for --explain. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if json_output:
+            import sys
+            print('{{"error": "Ghost explain failed: {}"}}'.format(e), file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[red]Ghost explain failed: {}[/red]".format(e))
+        return None
+
+
+def _render_ghost_explain_rich(explain_data):
+    """Render ghost explain response as Rich terminal output."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    refined = explain_data.get("refined_total_gb", 0)
+    heuristic = explain_data.get("heuristic_total_gb", 0)
+    quality = explain_data.get("estimate_quality", "unknown")
+    confidence = explain_data.get("confidence", "unknown")
+
+    # Confidence color
+    conf_colors = {"high": "green", "medium": "yellow", "low": "red"}
+    conf_color = conf_colors.get(confidence, "white")
+
+    # Header with delta
+    if heuristic > 0 and refined != heuristic:
+        delta_pct = ((refined - heuristic) / heuristic) * 100
+        sign = "+" if delta_pct > 0 else ""
+        console.print(
+            "\n[bold cyan]AI-Refined VRAM Estimate[/bold cyan]"
+            "  [dim]({})[/dim]".format(quality)
+        )
+        console.print(
+            "  Heuristic: [dim]{:.2f} GB[/dim]  ->  "
+            "Agent: [bold]{:.2f} GB[/bold]  [{}]({}{:.0f}%)[/{}]".format(
+                heuristic, refined, conf_color, sign, delta_pct, conf_color,
+            )
+        )
+    else:
+        console.print(
+            "\n[bold cyan]AI-Refined VRAM Estimate[/bold cyan]"
+            "  [bold]{:.2f} GB[/bold]".format(refined)
+        )
+
+    console.print("  Confidence: [{}]{}[/{}]".format(conf_color, confidence, conf_color))
+
+    # Breakdown table
+    breakdown = explain_data.get("breakdown", [])
+    if breakdown:
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("Component", style="dim")
+        table.add_column("Heuristic", justify="right")
+        table.add_column("Refined", justify="right", style="bold")
+        table.add_column("Adjustment", style="dim")
+
+        for item in breakdown:
+            comp = item.get("component", "?")
+            h_gb = item.get("heuristic_gb", 0)
+            a_gb = item.get("agent_gb")
+            reasoning = item.get("reasoning", "")
+
+            h_str = "{:.2f} GB".format(h_gb)
+            if a_gb is not None:
+                a_str = "{:.2f} GB".format(a_gb)
+                # Truncate reasoning for table display
+                reason_short = reasoning[:60] + "..." if len(reasoning) > 60 else reasoning
+            else:
+                a_str = "[dim]—[/dim]"
+                reason_short = ""
+
+            table.add_row(comp.capitalize(), h_str, a_str, reason_short)
+
+        console.print()
+        console.print(table)
+
+    # Architecture insight
+    insight = explain_data.get("architecture_insight", "")
+    if insight:
+        console.print("\n  [dim]{}[/dim]".format(insight))
+
+    # Adjustments
+    adjustments = explain_data.get("adjustments", [])
+    if adjustments:
+        console.print("\n[bold]Adjustments:[/bold]")
+        for adj in adjustments:
+            console.print("  - {}".format(adj))
+
+    # GPU recommendations
+    gpu_recs = explain_data.get("gpu_recommendations", [])
+    if gpu_recs:
+        console.print("\n[bold]GPU Fit:[/bold]")
+        for rec in gpu_recs:
+            console.print("  - {}".format(rec))
+
+    console.print()
 
 
 @app.command()
@@ -106,6 +303,7 @@ def run(
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show hardware context, sample dump, recommendation reasoning"),
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
+    after: Optional[str] = typer.Option(None, "--after", help="Previous run ID to compare against (outcome tracking)"),
 ):
     """Run a training command with GPU monitoring."""
     from alloc.probe import probe_command
@@ -207,6 +405,7 @@ def run(
             "objective": objective,
             "max_budget_hourly": max_budget_hourly,
             "command": " ".join(command),
+            "baseline_run_id": after,
         }
         # Merge timing fields from callback sidecar
         if callback_data:
@@ -276,14 +475,22 @@ def diagnose(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show rule details and references"),
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml"),
     severity: Optional[str] = typer.Option(None, "--severity", help="Filter: critical, warning, info"),
-    category: Optional[str] = typer.Option(None, "--category", help="Filter: dataloader, memory, precision, distributed, throughput"),
+    category: Optional[str] = typer.Option(None, "--category", help="Filter: dataloader, memory, precision, distributed, throughput, upgrade"),
     # Phase 2 flags
     artifact: Optional[str] = typer.Option(None, "--artifact", help="Path to alloc_artifact.json.gz"),
     no_artifact: bool = typer.Option(False, "--no-artifact", help="Skip artifact auto-discovery (AST-only)"),
     memory: bool = typer.Option(False, "--memory", help="Show VRAM breakdown"),
     efficiency: bool = typer.Option(False, "--efficiency", help="Show step time decomposition"),
     compare: Optional[str] = typer.Option(None, "--compare", help="Compare with another artifact"),
+    upgrades: bool = typer.Option(False, "--upgrades", help="Scan for outdated patterns and upgrade opportunities"),
     rules: bool = typer.Option(False, "--rules", help="List all available diagnosis rules"),
+    explain: bool = typer.Option(False, "--explain", help="AI-powered explanation of findings (Pro tier, requires login)"),
+    fix: bool = typer.Option(False, "--fix", help="AI-generated code patches for findings (Pro tier, requires login)"),
+    what_if: Optional[str] = typer.Option(None, "--what-if", help='Estimate impact of a change, e.g. --what-if "switch to bf16"'),
+    comm: bool = typer.Option(False, "--comm", help="AI-powered communication overhead analysis (Pro tier, requires login)"),
+    root_cause: bool = typer.Option(False, "--root-cause", help="AI-powered root cause diagnosis for ambiguous bottlenecks (Pro tier, requires login)"),
+    migrate: Optional[str] = typer.Option(None, "--migrate", help='Plan migration to target hardware, e.g. --migrate "8x H100-80GB"'),
+    explore: bool = typer.Option(False, "--explore", help="AI-powered Pareto knob exploration (Pro tier, requires login)"),
 ):
     """Analyze a training script for performance issues."""
     if rules:
@@ -379,10 +586,40 @@ def diagnose(
         cat = category.strip().lower()
         result.findings = [d for d in result.findings if d.category == cat]
         result.summary = _recount_summary(result.findings)
+    if upgrades:
+        from alloc.diagnosis_rules import UPGRADE_RULE_IDS
+        result.findings = [d for d in result.findings if d.rule_id in UPGRADE_RULE_IDS]
+        result.summary = _recount_summary(result.findings)
+
+    # --explain / --fix / --what-if / --comm / --root-cause / --migrate / --explore: fetch AI response before output
+    explain_data = None
+    fix_data = None
+    what_if_data = None
+    comm_data = None
+    root_cause_data = None
+    migrate_data = None
+    explore_data = None
+    if explain:
+        explain_data = _fetch_explain(result, findings, artifact_data, hw, script, json_output)
+    if fix:
+        fix_data = _fetch_fix(result, findings, artifact_data, hw, script, json_output)
+    if what_if:
+        what_if_data = _fetch_what_if(result, findings, artifact_data, hw, script, what_if, json_output)
+    if comm:
+        comm_data = _fetch_comm(result, findings, artifact_data, hw, json_output)
+    if root_cause:
+        root_cause_data = _fetch_root_cause(result, findings, artifact_data, hw, script, json_output)
+    if migrate:
+        migrate_data = _fetch_migrate(result, findings, artifact_data, hw, script, migrate, json_output)
+    if explore:
+        explore_data = _fetch_explore(result, findings, artifact_data, hw, script, json_output)
 
     # Output routing
     if json_output:
-        print_diagnose_json(result)
+        print_diagnose_json(result, explain_data=explain_data, fix_data=fix_data,
+                            what_if_data=what_if_data, comm_data=comm_data,
+                            root_cause_data=root_cause_data, migrate_data=migrate_data,
+                            explore_data=explore_data)
     elif memory:
         print_diagnose_memory(result)
     elif efficiency:
@@ -399,6 +636,23 @@ def diagnose(
     else:
         print_diagnose_rich(result, verbose=verbose)
 
+    # AI output: render Rich (when not --json)
+    if not json_output:
+        if explain and explain_data:
+            _render_explain_rich(explain_data)
+        if fix and fix_data:
+            _render_fix_rich(fix_data)
+        if what_if and what_if_data:
+            _render_what_if_rich(what_if_data)
+        if comm and comm_data:
+            _render_comm_rich(comm_data)
+        if root_cause and root_cause_data:
+            _render_root_cause_rich(root_cause_data)
+        if migrate and migrate_data:
+            _render_migrate_rich(migrate_data)
+        if explore and explore_data:
+            _render_explore_rich(explore_data)
+
 
 def _recount_summary(findings):
     """Recount summary after filtering."""
@@ -407,6 +661,1236 @@ def _recount_summary(findings):
         if d.severity in summary:
             summary[d.severity] += 1
     return summary
+
+
+def _build_workload_context(findings, artifact_data, hw):
+    """Build WorkloadContext dict from AST findings + artifact + hardware."""
+    ctx = {}
+
+    # Framework detection
+    frameworks = set()
+    for d in findings.distributed:
+        if d.kind == "hf_trainer":
+            frameworks.add("hf_trainer")
+        elif d.kind == "deepspeed":
+            frameworks.add("deepspeed")
+        elif d.kind == "accelerate":
+            frameworks.add("accelerate")
+        elif d.kind in ("ddp", "fsdp"):
+            frameworks.add(d.kind)
+    if frameworks:
+        ctx["framework"] = sorted(frameworks)[0]  # Primary framework
+
+    # Strategy detection
+    for d in findings.distributed:
+        if d.kind in ("ddp", "fsdp"):
+            ctx["strategy"] = d.kind
+
+    # Optimizer detection
+    for opt in findings.optimizers:
+        ctx["optimizer_type"] = opt.optimizer_type
+        break
+
+    # Fine-tuning detection
+    if hasattr(findings, "fine_tuning") and findings.fine_tuning:
+        ft = findings.fine_tuning[0]
+        ctx["fine_tuning_method"] = ft.method
+
+    # Gradient checkpointing
+    if hasattr(findings, "has_gradient_checkpointing"):
+        ctx["gradient_checkpointing"] = findings.has_gradient_checkpointing
+
+    # Model name
+    for m in findings.models:
+        if m.kind == "from_pretrained" and m.model_name:
+            ctx["model_name"] = m.model_name
+            break
+
+    # Architecture type inference
+    if ctx.get("model_name"):
+        name = ctx["model_name"].lower()
+        if any(k in name for k in ("llama", "gpt", "mistral", "qwen", "phi", "gemma", "falcon")):
+            ctx["architecture_type"] = "transformer"
+        elif any(k in name for k in ("resnet", "efficientnet", "mobilenet", "convnext")):
+            ctx["architecture_type"] = "cnn"
+        elif any(k in name for k in ("vit", "deit", "beit", "swin", "dinov2", "clip")):
+            ctx["architecture_type"] = "transformer"  # Vision transformers
+        elif any(k in name for k in ("stable-diffusion", "sdxl", "flux")):
+            ctx["architecture_type"] = "diffusion"
+        elif any(k in name for k in ("mixtral", "switch")):
+            ctx["architecture_type"] = "moe"
+        elif any(k in name for k in ("whisper", "wav2vec")):
+            ctx["architecture_type"] = "transformer"
+    if "architecture_type" not in ctx:
+        ctx["architecture_type"] = "unknown"
+
+    # From artifact
+    if artifact_data:
+        probe = artifact_data.get("probe", {})
+        if probe.get("gpu_count"):
+            ctx["num_gpus"] = probe["gpu_count"]
+        if probe.get("interconnect_type"):
+            ctx["interconnect_type"] = probe["interconnect_type"]
+
+        hw_ctx = artifact_data.get("hardware_context", {})
+        if hw_ctx.get("num_gpus_detected"):
+            ctx["num_gpus"] = hw_ctx["num_gpus_detected"]
+        if hw_ctx.get("interconnect_type"):
+            ctx["interconnect_type"] = hw_ctx["interconnect_type"]
+
+    # From hardware context
+    if hw:
+        if hw.get("gpu_count"):
+            ctx.setdefault("num_gpus", hw["gpu_count"])
+
+    return ctx if ctx else None
+
+
+def _extract_code_snippets(script_path, findings):
+    """Extract relevant code snippets around each finding's line_number.
+
+    Returns dict of filename → code excerpt. Limits total to ~2000 lines.
+    """
+    snippets = {}
+    total_lines = 0
+    max_total = 2000
+    context_lines = 5  # lines before/after each finding
+
+    # Collect unique (file, line) pairs
+    file_lines = {}
+    for d in findings:
+        fp = d.file_path or script_path
+        if not fp or not os.path.isfile(fp):
+            continue
+        file_lines.setdefault(fp, set())
+        if d.line_number:
+            file_lines[fp].add(d.line_number)
+
+    for fp, lines_of_interest in file_lines.items():
+        if total_lines >= max_total:
+            break
+        try:
+            with open(fp, "r") as f:
+                all_lines = f.readlines()
+        except Exception:
+            continue
+
+        if not lines_of_interest:
+            # No specific lines — include first 50 lines
+            excerpt = all_lines[:50]
+            snippet = "".join(excerpt)
+        else:
+            # Merge ranges around each line of interest
+            ranges = set()
+            for ln in sorted(lines_of_interest):
+                start = max(0, ln - 1 - context_lines)
+                end = min(len(all_lines), ln + context_lines)
+                for i in range(start, end):
+                    ranges.add(i)
+
+            sorted_ranges = sorted(ranges)
+            parts = []
+            prev = -2
+            for idx in sorted_ranges:
+                if idx > prev + 1:
+                    if parts:
+                        parts.append("# ...\n")
+                parts.append(all_lines[idx] if idx < len(all_lines) else "")
+                prev = idx
+            snippet = "".join(parts)
+
+        remaining = max_total - total_lines
+        snippet_lines = snippet.split("\n")[:remaining]
+        snippets[os.path.basename(fp)] = "\n".join(snippet_lines)
+        total_lines += len(snippet_lines)
+
+    return snippets if snippets else None
+
+
+def _fetch_explain(result, findings, artifact_data, hw, script, json_output, quiet=False):
+    """Fetch AI explanation from the API. Returns explain dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if not quiet:
+            if json_output:
+                import sys
+                print('{"error": "Login required for --explain. Run: alloc login"}', file=sys.stderr)
+            else:
+                from rich.console import Console
+                Console(stderr=True).print("[yellow]Login required for --explain. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        structured_findings = []
+        for d in result.findings:
+            finding = {
+                "rule_id": d.rule_id,
+                "severity": d.severity,
+                "message": d.title,
+                "suggestion": d.rationale,
+                "line_number": d.line_number,
+                "file_path": d.file_path,
+                "category": d.category,
+            }
+            if d.evidence:
+                finding["evidence"] = {str(k): str(v) for k, v in d.evidence.items()}
+            structured_findings.append(finding)
+
+        payload = {
+            "findings": structured_findings,
+            "workload": workload,
+            "hardware": result.hardware_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        code_context = _extract_code_snippets(script, result.findings)
+        if code_context:
+            payload["code_context"] = code_context
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/explain".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if not quiet:
+                    if json_output:
+                        import sys
+                        print('{"error": "Pro tier required for --explain"}', file=sys.stderr)
+                    else:
+                        from rich.console import Console
+                        Console(stderr=True).print("[yellow]Pro tier required for --explain. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if not quiet:
+            if json_output:
+                import sys
+                print('{{"error": "Explain request failed: {}"}}'.format(e), file=sys.stderr)
+            else:
+                from rich.console import Console
+                Console(stderr=True).print("[red]Explain request failed: {}[/red]".format(e))
+        return None
+
+
+def _render_explain_rich(explain_data):
+    """Render explain response as Rich terminal output."""
+    from rich.console import Console
+    console = Console()
+
+    console.print("\n[bold cyan]AI Explanation[/bold cyan]")
+    console.print(explain_data.get("summary", ""))
+
+    arch_insight = explain_data.get("architecture_insight")
+    if arch_insight:
+        console.print("\n[dim]{}[/dim]".format(arch_insight))
+
+    actions = explain_data.get("actions", [])
+    if actions:
+        console.print("\n[bold]Priority Actions:[/bold]")
+        for action in actions:
+            priority = action.get("priority", "?")
+            title = action.get("title", "")
+            explanation = action.get("explanation", "")
+            impact = action.get("impact", "")
+            confidence = action.get("confidence", "")
+            finding_id = action.get("finding_id", "")
+            label = " ({})".format(finding_id) if finding_id else ""
+            console.print("  {}. [bold]{}[/bold]{}".format(priority, title, label))
+            console.print("     {}".format(explanation))
+            if impact:
+                console.print("     [dim]Impact: {}[/dim]".format(impact))
+            if confidence:
+                console.print("     [dim]Confidence: {}[/dim]".format(confidence))
+
+    interactions = explain_data.get("interactions")
+    if interactions:
+        console.print("\n[bold]Interactions:[/bold]")
+        for ix in interactions:
+            ids = ", ".join(ix.get("finding_ids", []))
+            desc = ix.get("description", "")
+            console.print("  [{}] {}".format(ids, desc))
+
+
+def _fetch_fix(result, findings, artifact_data, hw, script, json_output, quiet=False):
+    """Fetch AI-generated code patches from the API. Returns fix dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if not quiet:
+            if json_output:
+                import sys
+                print('{"error": "Login required for --fix. Run: alloc login"}', file=sys.stderr)
+            else:
+                from rich.console import Console
+                Console(stderr=True).print("[yellow]Login required for --fix. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        structured_findings = []
+        for d in result.findings:
+            finding = {
+                "rule_id": d.rule_id,
+                "severity": d.severity,
+                "message": d.title,
+                "suggestion": d.rationale,
+                "line_number": d.line_number,
+                "file_path": d.file_path,
+                "category": d.category,
+            }
+            if d.evidence:
+                finding["evidence"] = {str(k): str(v) for k, v in d.evidence.items()}
+            structured_findings.append(finding)
+
+        # For --fix, send full file contents (not just snippets)
+        code_context = _read_full_files(script, result.findings)
+
+        payload = {
+            "findings": structured_findings,
+            "workload": workload,
+            "hardware": result.hardware_context,
+            "code_context": code_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        with httpx.Client(timeout=90) as client:
+            resp = client.post(
+                "{}/diagnose/fix".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if not quiet:
+                    if json_output:
+                        import sys
+                        print('{"error": "Pro tier required for --fix"}', file=sys.stderr)
+                    else:
+                        from rich.console import Console
+                        Console(stderr=True).print("[yellow]Pro tier required for --fix. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if not quiet:
+            if json_output:
+                import sys
+                print('{{"error": "Fix request failed: {}"}}'.format(e), file=sys.stderr)
+            else:
+                from rich.console import Console
+                Console(stderr=True).print("[red]Fix request failed: {}[/red]".format(e))
+        return None
+
+
+def _fetch_what_if(result, findings, artifact_data, hw, script, scenario, json_output):
+    """Fetch what-if analysis from the API. Returns what-if dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if json_output:
+            import sys
+            print('{"error": "Login required for --what-if. Run: alloc login"}', file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[yellow]Login required for --what-if. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        structured_findings = []
+        for d in result.findings:
+            finding = {
+                "rule_id": d.rule_id,
+                "severity": d.severity,
+                "message": d.title,
+                "suggestion": d.rationale,
+                "line_number": d.line_number,
+                "file_path": d.file_path,
+                "category": d.category,
+            }
+            if d.evidence:
+                finding["evidence"] = {str(k): str(v) for k, v in d.evidence.items()}
+            structured_findings.append(finding)
+
+        code_context = _extract_code_snippets(script, result.findings)
+
+        payload = {
+            "scenario": scenario,
+            "findings": structured_findings,
+            "workload": workload,
+            "hardware": result.hardware_context,
+            "code_context": code_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/what-if".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if json_output:
+                    import sys
+                    print('{"error": "Pro tier required for --what-if"}', file=sys.stderr)
+                else:
+                    from rich.console import Console
+                    Console(stderr=True).print("[yellow]Pro tier required for --what-if. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if json_output:
+            import sys
+            print('{{"error": "What-if request failed: {}"}}'.format(e), file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[red]What-if request failed: {}[/red]".format(e))
+        return None
+
+
+def _read_full_files(script, findings):
+    """Read full file contents for files mentioned in findings (for --fix).
+
+    Returns dict of {filename: content}, capped at 10 files.
+    """
+    import os
+
+    files = set()
+    if script and os.path.isfile(script):
+        files.add(script)
+    for d in findings:
+        if d.file_path and os.path.isfile(d.file_path):
+            files.add(d.file_path)
+
+    code_context = {}
+    total_lines = 0
+    for filepath in sorted(files)[:10]:
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            lines = content.split("\n")
+            remaining = 3000 - total_lines
+            if remaining <= 0:
+                break
+            if len(lines) > remaining:
+                lines = lines[:remaining]
+                content = "\n".join(lines)
+            total_lines += len(lines)
+            code_context[filepath] = content
+        except Exception:
+            pass
+
+    return code_context if code_context else None
+
+
+def _render_fix_rich(fix_data):
+    """Render fix response as Rich terminal output with syntax-highlighted patches."""
+    from rich.console import Console
+    from rich.syntax import Syntax
+
+    console = Console()
+
+    console.print("\n[bold green]AI-Generated Fixes[/bold green]")
+    console.print(fix_data.get("summary", ""))
+
+    patches = fix_data.get("patches", [])
+    if not patches:
+        console.print("[dim]No patches generated.[/dim]")
+        return
+
+    for i, patch in enumerate(patches, 1):
+        file_path = patch.get("file_path", "unknown")
+        description = patch.get("description", "")
+        diff_text = patch.get("diff", "")
+        confidence = patch.get("confidence", "")
+        finding_ids = patch.get("finding_ids", [])
+
+        ids_label = " ({})".format(", ".join(finding_ids)) if finding_ids else ""
+        console.print("\n[bold]Patch {}: {}[/bold]{}".format(i, file_path, ids_label))
+        console.print("  {}".format(description))
+        if confidence:
+            console.print("  [dim]Confidence: {}[/dim]".format(confidence))
+
+        if diff_text:
+            syntax = Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+            console.print(syntax)
+
+    warnings = fix_data.get("warnings", [])
+    if warnings:
+        console.print("\n[yellow]Warnings:[/yellow]")
+        for w in warnings:
+            console.print("  - {}".format(w))
+
+    console.print("\n[dim]Review patches carefully before applying. "
+                  "Use: patch -p1 < fix.patch[/dim]")
+
+
+def _render_what_if_rich(what_if_data):
+    """Render what-if response as Rich terminal output."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    scenario = what_if_data.get("scenario", "")
+    feasible = what_if_data.get("feasible", True)
+    summary = what_if_data.get("summary", "")
+
+    console.print("\n[bold magenta]What-If Analysis[/bold magenta]")
+    console.print("[dim]Scenario: {}[/dim]".format(scenario))
+
+    if not feasible:
+        console.print("[red bold]Not feasible[/red bold]: {}".format(summary))
+    else:
+        console.print(summary)
+
+    impacts = what_if_data.get("impacts", [])
+    if impacts:
+        table = Table(title="Estimated Impact", show_header=True)
+        table.add_column("Metric", style="bold")
+        table.add_column("Direction")
+        table.add_column("Magnitude")
+        table.add_column("Reasoning", max_width=50)
+
+        direction_styles = {
+            "increase": "[green]increase[/green]",
+            "decrease": "[red]decrease[/red]",
+            "unchanged": "[dim]unchanged[/dim]",
+        }
+
+        for imp in impacts:
+            metric = imp.get("metric", "")
+            direction = imp.get("direction", "unchanged")
+            magnitude = imp.get("magnitude", "")
+            reasoning = imp.get("reasoning", "")
+
+            # Color-code direction based on whether it's good or bad
+            styled_dir = direction_styles.get(direction, direction)
+            # For VRAM and cost, decrease is good (green)
+            if metric in ("vram", "cost") and direction == "decrease":
+                styled_dir = "[green]decrease[/green]"
+            elif metric in ("vram", "cost") and direction == "increase":
+                styled_dir = "[red]increase[/red]"
+            # For throughput, increase is good
+            elif metric == "throughput" and direction == "increase":
+                styled_dir = "[green]increase[/green]"
+            elif metric == "throughput" and direction == "decrease":
+                styled_dir = "[red]decrease[/red]"
+
+            table.add_row(metric, styled_dir, magnitude or "-", reasoning)
+
+        console.print(table)
+
+    risks = what_if_data.get("risks", [])
+    if risks:
+        console.print("\n[yellow]Risks:[/yellow]")
+        for r in risks:
+            console.print("  - {}".format(r))
+
+    steps = what_if_data.get("suggested_steps", [])
+    if steps:
+        console.print("\n[bold]Steps to implement:[/bold]")
+        for i, step in enumerate(steps, 1):
+            console.print("  {}. {}".format(i, step))
+
+
+def _fetch_comm(result, findings, artifact_data, hw, json_output):
+    """Fetch AI communication analysis from the API. Returns comm dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if json_output:
+            import sys
+            print('{"error": "Login required for --comm. Run: alloc login"}', file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[yellow]Login required for --comm. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        payload = {
+            "workload": workload,
+            "hardware": result.hardware_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/comm-analysis".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if json_output:
+                    import sys
+                    print('{"error": "Pro tier required for --comm"}', file=sys.stderr)
+                else:
+                    from rich.console import Console
+                    Console(stderr=True).print("[yellow]Pro tier required for --comm. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if json_output:
+            import sys
+            print('{{"error": "Comm analysis failed: {}"}}'.format(e), file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[red]Comm analysis failed: {}[/red]".format(e))
+        return None
+
+
+def _render_comm_rich(comm_data):
+    """Render communication analysis as Rich terminal output."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    analysis = comm_data.get("analysis", {})
+    quality = comm_data.get("estimate_quality", "unknown")
+
+    console.print("\n[bold cyan]Communication Overhead Analysis[/bold cyan]")
+
+    total = analysis.get("total_overhead_pct", 0)
+    heuristic = analysis.get("heuristic_overhead_pct")
+    bottleneck = analysis.get("bottleneck_type")
+
+    # Summary line
+    quality_label = "[green]Agent-refined[/green]" if quality == "agent_reasoned" else "[dim]Heuristic-only[/dim]"
+    console.print("Total overhead: [bold]{:.1f}%[/bold] ({})".format(total, quality_label))
+    if heuristic is not None and quality == "agent_reasoned":
+        delta = total - heuristic
+        if abs(delta) > 0.5:
+            direction = "[red]+{:.1f}%[/red]" if delta > 0 else "[green]{:.1f}%[/green]"
+            console.print("  Heuristic estimate was {:.1f}% (agent adjusted by {})".format(
+                heuristic, direction.format(delta)))
+
+    if bottleneck:
+        label_map = {
+            "bandwidth_limited": "[red]Bandwidth Limited[/red]",
+            "latency_limited": "[yellow]Latency Limited[/yellow]",
+            "compute_dominated": "[green]Compute Dominated[/green]",
+            "well_balanced": "[green]Well Balanced[/green]",
+        }
+        console.print("Bottleneck: {}".format(label_map.get(bottleneck, bottleneck)))
+
+    # Breakdown table
+    breakdown = analysis.get("breakdown", [])
+    if breakdown:
+        table = Table(title="Overhead Breakdown", show_header=True)
+        table.add_column("Source", style="bold")
+        table.add_column("Heuristic %", justify="right")
+        table.add_column("Agent %", justify="right")
+        table.add_column("Reasoning", max_width=50)
+
+        for item in breakdown:
+            source = item.get("source", "").replace("_", " ").title()
+            h_pct = item.get("heuristic_pct")
+            a_pct = item.get("agent_pct")
+            reasoning = item.get("reasoning", "")
+
+            h_str = "{:.1f}".format(h_pct) if h_pct is not None else "-"
+            a_str = "{:.1f}".format(a_pct) if a_pct is not None else "-"
+
+            table.add_row(source, h_str, a_str, reasoning)
+
+        console.print(table)
+
+    # Overlap assessment
+    overlap = analysis.get("overlap_assessment")
+    if overlap:
+        console.print("\n[bold]Overlap Analysis:[/bold] {}".format(overlap))
+
+    # Scaling assessment
+    scaling = analysis.get("scaling_assessment")
+    if scaling:
+        console.print("[bold]Scaling:[/bold] {}".format(scaling))
+
+    # Recommendations
+    recs = analysis.get("recommendations", [])
+    if recs:
+        console.print("\n[bold]Recommendations:[/bold]")
+        for r in recs:
+            console.print("  - {}".format(r))
+
+
+def _fetch_root_cause(result, findings, artifact_data, hw, script, json_output):
+    """Fetch AI root cause diagnosis from the API. Returns dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if json_output:
+            import sys
+            print('{"error": "Login required for --root-cause. Run: alloc login"}', file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[yellow]Login required for --root-cause. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        structured_findings = []
+        for d in result.findings:
+            finding = {
+                "rule_id": d.rule_id,
+                "severity": d.severity,
+                "message": d.title,
+                "suggestion": d.rationale,
+                "category": d.category,
+            }
+            if d.evidence:
+                finding["evidence"] = {str(k): str(v) for k, v in d.evidence.items()}
+            structured_findings.append(finding)
+
+        payload = {
+            "findings": structured_findings,
+            "workload": workload,
+            "hardware": result.hardware_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        # Derive signal patterns from artifact data
+        if artifact_data:
+            probe = artifact_data.get("probe", {})
+            samples = probe.get("samples", [])
+
+            # GPU utilization pattern
+            if samples:
+                utils = [s.get("gpu_util_pct", 0) for s in samples if s.get("gpu_util_pct") is not None]
+                if utils:
+                    avg_util = sum(utils) / len(utils)
+                    import statistics
+                    if len(utils) > 1:
+                        stdev = statistics.stdev(utils)
+                        cov = stdev / max(avg_util, 1)
+                        if cov > 0.3:
+                            payload["gpu_utilization_pattern"] = "spiky"
+                        elif avg_util > 70:
+                            payload["gpu_utilization_pattern"] = "steady_high"
+                        else:
+                            payload["gpu_utilization_pattern"] = "steady_low"
+
+            # VRAM pattern from per-rank data
+            per_rank = probe.get("per_rank_peak_vram_mb")
+            if per_rank and len(per_rank) > 1:
+                max_v = max(per_rank)
+                min_v = min(per_rank)
+                if max_v > 0 and (max_v - min_v) / max_v > 0.15:
+                    payload["vram_pattern"] = "skewed"
+                else:
+                    payload["vram_pattern"] = "uniform"
+
+            # Step time variance
+            step_p50 = probe.get("step_time_ms_p50")
+            step_p90 = probe.get("step_time_ms_p90")
+            if step_p50 and step_p90 and step_p50 > 0:
+                ratio = step_p90 / step_p50
+                if ratio > 1.15:
+                    payload["step_time_variance"] = "high"
+                elif ratio > 1.05:
+                    payload["step_time_variance"] = "moderate"
+                else:
+                    payload["step_time_variance"] = "low"
+
+        code_context = _extract_code_snippets(script, result.findings)
+        if code_context:
+            payload["code_context"] = code_context
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/root-cause".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if json_output:
+                    import sys
+                    print('{"error": "Pro tier required for --root-cause"}', file=sys.stderr)
+                else:
+                    from rich.console import Console
+                    Console(stderr=True).print("[yellow]Pro tier required for --root-cause. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if json_output:
+            import sys
+            print('{{"error": "Root cause analysis failed: {}"}}'.format(e), file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[red]Root cause analysis failed: {}[/red]".format(e))
+        return None
+
+
+def _render_root_cause_rich(data):
+    """Render root cause diagnosis as Rich terminal output."""
+    from rich.console import Console
+    from rich.panel import Panel
+
+    console = Console()
+
+    console.print("\n[bold cyan]Root Cause Diagnosis[/bold cyan]")
+
+    signal_quality = data.get("signal_quality", "unknown")
+    quality_map = {
+        "full": "[green]Full (all signals available)[/green]",
+        "partial": "[yellow]Partial (some signals missing)[/yellow]",
+        "minimal": "[red]Minimal (limited data)[/red]",
+    }
+    console.print("Signal quality: {}".format(quality_map.get(signal_quality, signal_quality)))
+
+    summary = data.get("diagnostic_summary", "")
+    if summary:
+        console.print("\n{}".format(summary))
+
+    # Primary hypothesis
+    primary = data.get("primary_hypothesis", {})
+    if primary:
+        cause = primary.get("cause", "unknown").replace("_", " ").title()
+        confidence = primary.get("confidence", "unknown")
+        explanation = primary.get("explanation", "")
+
+        conf_style = {
+            "high": "[bold green]HIGH[/bold green]",
+            "medium": "[bold yellow]MEDIUM[/bold yellow]",
+            "low": "[bold red]LOW[/bold red]",
+        }
+
+        console.print("\n[bold]Primary Cause:[/bold] {} (confidence: {})".format(
+            cause, conf_style.get(confidence, confidence)))
+        console.print("  {}".format(explanation))
+
+        evidence = primary.get("supporting_evidence", [])
+        if evidence:
+            console.print("  [dim]Supporting evidence:[/dim]")
+            for e in evidence:
+                console.print("    + {}".format(e))
+
+        contra = primary.get("contradicting_evidence", [])
+        if contra:
+            console.print("  [dim]Contradicting evidence:[/dim]")
+            for c in contra:
+                console.print("    - {}".format(c))
+
+    # Alternative hypotheses
+    alternatives = data.get("alternative_hypotheses", [])
+    if alternatives:
+        console.print("\n[bold]Alternative Hypotheses:[/bold]")
+        for alt in alternatives:
+            alt_cause = alt.get("cause", "unknown").replace("_", " ").title()
+            alt_conf = alt.get("confidence", "unknown")
+            alt_expl = alt.get("explanation", "")
+            console.print("  [dim]{}[/dim] ({}) — {}".format(alt_cause, alt_conf, alt_expl))
+
+    # Next steps
+    steps = data.get("next_steps", [])
+    if steps:
+        console.print("\n[bold]Next Steps:[/bold]")
+        for i, step in enumerate(steps, 1):
+            console.print("  {}. {}".format(i, step))
+
+
+def _fetch_migrate(result, findings, artifact_data, hw, script, target, json_output):
+    """Fetch AI migration plan from the API. Returns dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if json_output:
+            import sys
+            print('{"error": "Login required for --migrate. Run: alloc login"}', file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[yellow]Login required for --migrate. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        structured_findings = []
+        for d in result.findings:
+            finding = {
+                "rule_id": d.rule_id,
+                "severity": d.severity,
+                "message": d.title,
+                "suggestion": d.rationale,
+                "category": d.category,
+            }
+            if d.evidence:
+                finding["evidence"] = {str(k): str(v) for k, v in d.evidence.items()}
+            structured_findings.append(finding)
+
+        payload = {
+            "target_hardware": target,
+            "findings": structured_findings,
+            "workload": workload,
+            "hardware": result.hardware_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        code_context = _extract_code_snippets(script, result.findings)
+        if code_context:
+            payload["code_context"] = code_context
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/migrate".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if json_output:
+                    import sys
+                    print('{"error": "Pro tier required for --migrate"}', file=sys.stderr)
+                else:
+                    from rich.console import Console
+                    Console(stderr=True).print("[yellow]Pro tier required for --migrate. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if json_output:
+            import sys
+            print('{{"error": "Migration planning failed: {}"}}'.format(e), file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[red]Migration planning failed: {}[/red]".format(e))
+        return None
+
+
+def _render_migrate_rich(data):
+    """Render migration plan as Rich terminal output."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
+
+    target = data.get("target_hardware", "unknown")
+    feasible = data.get("feasible", True)
+    confidence = data.get("confidence", "medium")
+    summary = data.get("summary", "")
+
+    # Header
+    status = "[bold green]FEASIBLE[/bold green]" if feasible else "[bold red]NOT FEASIBLE[/bold red]"
+    console.print("\n[bold cyan]Migration Plan[/bold cyan] — {} ({})".format(target, status))
+
+    conf_style = {
+        "high": "[green]HIGH[/green]",
+        "medium": "[yellow]MEDIUM[/yellow]",
+        "low": "[red]LOW[/red]",
+    }
+    console.print("Confidence: {}".format(conf_style.get(confidence, confidence)))
+
+    if summary:
+        console.print("\n{}".format(summary))
+
+    # Steps table
+    steps = data.get("steps", [])
+    if steps:
+        console.print("\n[bold]Migration Steps:[/bold]")
+
+        cat_style = {
+            "strategy": "[bold blue]Strategy[/bold blue]",
+            "precision": "[bold magenta]Precision[/bold magenta]",
+            "batch_size": "[bold yellow]Batch Size[/bold yellow]",
+            "dataloader": "[bold green]Dataloader[/bold green]",
+            "hardware_feature": "[bold cyan]Hardware[/bold cyan]",
+            "config": "[bold white]Config[/bold white]",
+        }
+
+        for i, step in enumerate(steps, 1):
+            cat = step.get("category", "config")
+            cat_label = cat_style.get(cat, cat)
+            change = step.get("change", "")
+            reasoning = step.get("reasoning", "")
+            impact = step.get("impact", "")
+            code = step.get("code_change", "")
+
+            console.print("\n  {}. {} {}".format(i, cat_label, change))
+            console.print("     [dim]{}[/dim]".format(reasoning))
+            if impact:
+                console.print("     Impact: [green]{}[/green]".format(impact))
+            if code:
+                from rich.syntax import Syntax
+                console.print("     Code:")
+                console.print(Syntax(code, "python", theme="monokai", line_numbers=False, padding=1))
+
+    # Projected comparison
+    comparison = data.get("projected_comparison")
+    if comparison:
+        console.print("\n[bold]Projected Comparison:[/bold]")
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("Metric")
+        table.add_column("Value")
+        for k, v in comparison.items():
+            label = k.replace("_", " ").title()
+            console.print("  {}: {}".format(label, v))
+
+    # Warnings
+    warnings = data.get("warnings", [])
+    if warnings:
+        console.print("\n[bold yellow]Warnings:[/bold yellow]")
+        for w in warnings:
+            console.print("  ! {}".format(w))
+
+
+def _fetch_explore(result, findings, artifact_data, hw, script, json_output):
+    """Fetch AI Pareto knob exploration from the API. Returns dict or None."""
+    from alloc.config import get_token, get_api_url
+
+    token = get_token()
+    if not token:
+        if json_output:
+            import sys
+            print('{"error": "Login required for --explore. Run: alloc login"}', file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[yellow]Login required for --explore. Run: alloc login[/yellow]")
+        return None
+
+    try:
+        import httpx
+
+        api_url = get_api_url()
+
+        workload = _build_workload_context(findings, artifact_data, hw)
+
+        structured_findings = []
+        for d in result.findings:
+            finding = {
+                "rule_id": d.rule_id,
+                "severity": d.severity,
+                "message": d.title,
+                "suggestion": d.rationale,
+                "category": d.category,
+            }
+            if d.evidence:
+                finding["evidence"] = {str(k): str(v) for k, v in d.evidence.items()}
+            structured_findings.append(finding)
+
+        payload = {
+            "findings": structured_findings,
+            "workload": workload,
+            "hardware": result.hardware_context,
+        }
+
+        if result.efficiency:
+            payload["metrics"] = result.efficiency
+
+        code_context = _extract_code_snippets(script, result.findings)
+        if code_context:
+            payload["code_context"] = code_context
+
+        # Pass budget from .alloc.yaml if available
+        gpu_context = _load_gpu_context(False)
+        if gpu_context and gpu_context.get("budget"):
+            budget = gpu_context["budget"]
+            if isinstance(budget, (int, float)) and budget > 0:
+                payload["budget_hourly"] = float(budget)
+
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                "{}/diagnose/explore".format(api_url),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer {}".format(token),
+                },
+            )
+
+            if resp.status_code == 403:
+                if json_output:
+                    import sys
+                    print('{"error": "Pro tier required for --explore"}', file=sys.stderr)
+                else:
+                    from rich.console import Console
+                    Console(stderr=True).print("[yellow]Pro tier required for --explore. Visit alloclabs.com/pricing[/yellow]")
+                return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+    except Exception as e:
+        if json_output:
+            import sys
+            print('{{"error": "Pareto exploration failed: {}"}}'.format(e), file=sys.stderr)
+        else:
+            from rich.console import Console
+            Console(stderr=True).print("[red]Pareto exploration failed: {}[/red]".format(e))
+        return None
+
+
+def _render_explore_rich(data):
+    """Render Pareto exploration results as Rich terminal output."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    summary = data.get("summary", "")
+    confidence = data.get("confidence", "medium")
+    configs = data.get("configs", [])
+    current = data.get("current_config")
+
+    # Header
+    conf_style = {
+        "high": "[green]HIGH[/green]",
+        "medium": "[yellow]MEDIUM[/yellow]",
+        "low": "[red]LOW[/red]",
+    }
+    console.print("\n[bold cyan]Pareto Knob Explorer[/bold cyan]")
+    console.print("Confidence: {}".format(conf_style.get(confidence, confidence)))
+
+    if summary:
+        console.print("\n{}".format(summary))
+
+    # Current config
+    if current:
+        console.print("\n[bold]Current Configuration:[/bold]")
+        for k, v in current.items():
+            console.print("  {}: {}".format(k, v))
+
+    # Configs table
+    if configs:
+        console.print("\n[bold]Pareto-Optimal Configurations:[/bold]")
+
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("#", style="dim")
+        table.add_column("Config")
+        table.add_column("Throughput")
+        table.add_column("$/hr")
+        table.add_column("$/step")
+        table.add_column("VRAM")
+
+        for cfg in configs:
+            rank = str(cfg.get("rank", ""))
+            label = cfg.get("label", "")
+            if cfg.get("is_recommended"):
+                label = "[bold green]{}[/bold green]".format(label)
+                rank = "[bold green]{}[/bold green]".format(rank)
+            throughput = cfg.get("projected_throughput", "-")
+            cost_hr = cfg.get("projected_cost_per_hour", "-")
+            cost_step = cfg.get("projected_cost_per_step", "-")
+            vram = cfg.get("projected_vram_gb", "-")
+            table.add_row(rank, label, throughput, cost_hr, cost_step, vram)
+
+        console.print(table)
+
+        # Show knob details for each config
+        for cfg in configs:
+            rank = cfg.get("rank", "?")
+            label = cfg.get("label", "")
+            knobs = cfg.get("knobs", {})
+            notes = cfg.get("tradeoff_notes")
+            if cfg.get("is_recommended"):
+                console.print("\n  [bold green]#{} {}[/bold green]".format(rank, label))
+            else:
+                console.print("\n  [bold]#{} {}[/bold]".format(rank, label))
+
+            for k, v in knobs.items():
+                console.print("    {}: {}".format(k, v))
+            if notes:
+                console.print("    [dim]{}[/dim]".format(notes))
+
+    # Knobs evaluated
+    knobs_list = data.get("knobs_evaluated")
+    if knobs_list:
+        console.print("\n[dim]Knobs evaluated: {}[/dim]".format(", ".join(knobs_list)))
+
+    # Warnings
+    warnings = data.get("warnings", [])
+    if warnings:
+        console.print("\n[bold yellow]Warnings:[/bold yellow]")
+        for w in warnings:
+            console.print("  ! {}".format(w))
 
 
 def _print_rules(json_output: bool) -> None:
@@ -423,6 +1907,7 @@ def _print_rules(json_output: bool) -> None:
         "xs": "cross-signal",
         "strag": "straggler",
         "reg": "regression",
+        "upg": "upgrade",
     }
 
     rules_info = []
@@ -521,9 +2006,9 @@ def scan(
         help="Interconnect: pcie, nvlink, infiniband, unknown",
     ),
     param_count_b: Optional[float] = typer.Option(None, "--param-count-b", "-p", help="Param count in billions (overrides model lookup)"),
-    batch_size: int = typer.Option(32, help="Batch size"),
-    seq_length: int = typer.Option(2048, help="Sequence length"),
-    hidden_dim: int = typer.Option(4096, help="Hidden dimension"),
+    batch_size: Optional[int] = typer.Option(None, help="Batch size (for transformer models)"),
+    seq_length: Optional[int] = typer.Option(None, help="Sequence length (for transformer models)"),
+    hidden_dim: Optional[int] = typer.Option(None, help="Hidden dimension (for transformer models)"),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
 ):
     """Remote ghost scan via Alloc API — no GPU needed."""
@@ -1163,6 +2648,431 @@ def init(
     if config.interconnect:
         console.print(f"  Interconnect: {config.interconnect}")
     console.print()
+
+
+@app.command()
+def merge(
+    artifacts: List[str] = typer.Argument(None, help="Artifact paths to merge (rank-tagged .json.gz files)"),
+    output: str = typer.Option("alloc_artifact_merged.json.gz", "--output", "-o", help="Output path"),
+    json_output: bool = typer.Option(False, "--json", help="Output merged artifact as JSON"),
+):
+    """Merge per-rank artifacts into a single artifact with straggler analysis."""
+    from alloc.artifact_loader import find_rank_artifacts, merge_artifacts as do_merge
+
+    # Auto-discover rank artifacts if none specified
+    paths = list(artifacts) if artifacts else find_rank_artifacts()
+    if not paths:
+        console.print("[yellow]No rank artifacts found. Run distributed training with callbacks first.[/yellow]")
+        console.print("[dim]Looking for alloc_artifact_rank*.json.gz in current directory[/dim]")
+        raise typer.Exit(1)
+
+    if not json_output:
+        console.print(f"Merging {len(paths)} rank artifact(s)...")
+        for p in paths:
+            console.print(f"  {p}")
+
+    merged = do_merge(paths)
+    if merged is None:
+        console.print("[red]Failed to merge artifacts — no valid data found.[/red]")
+        raise typer.Exit(1)
+
+    if json_output:
+        import json as json_mod
+        from dataclasses import asdict
+        print(json_mod.dumps(asdict(merged), indent=2, default=str))
+        return
+
+    # Write merged artifact
+    try:
+        from alloc.artifact_writer import write_report
+        probe_dict = {}
+        if merged.peak_vram_mb is not None:
+            probe_dict["peak_vram_mb"] = merged.peak_vram_mb
+        if merged.avg_gpu_util is not None:
+            probe_dict["avg_gpu_util"] = merged.avg_gpu_util
+        if merged.step_time_p50_ms is not None:
+            probe_dict["step_time_ms_p50"] = merged.step_time_p50_ms
+        if merged.step_time_p90_ms is not None:
+            probe_dict["step_time_ms_p90"] = merged.step_time_p90_ms
+        if merged.per_rank_peak_vram_mb:
+            probe_dict["per_rank_peak_vram_mb"] = merged.per_rank_peak_vram_mb
+        if merged.per_rank_step_times_ms:
+            probe_dict["per_rank_step_times_ms"] = merged.per_rank_step_times_ms
+        if merged.has_phase_timing:
+            probe_dict["has_phase_timing"] = True
+            for attr in ("phase_forward_ms_p50", "phase_forward_ms_p90",
+                        "phase_backward_ms_p50", "phase_backward_ms_p90",
+                        "phase_optimizer_ms_p50", "phase_optimizer_ms_p90",
+                        "phase_dataloader_ms_p50", "phase_dataloader_ms_p90"):
+                val = getattr(merged, attr, None)
+                if val is not None:
+                    probe_dict[attr] = val
+        probe_dict["gpu_name"] = merged.gpu_name
+        probe_dict["num_gpus_detected"] = merged.gpu_count
+        probe_dict["source"] = "merged"
+        probe_dict["is_distributed"] = True
+        probe_dict["world_size"] = merged.gpu_count
+
+        hw = {}
+        if merged.gpu_name:
+            hw["gpu_name"] = merged.gpu_name
+        if merged.per_gpu_vram_total_mb:
+            hw["gpu_total_vram_mb"] = merged.per_gpu_vram_total_mb
+        hw["num_gpus_detected"] = merged.gpu_count
+
+        written = write_report(
+            probe_result=probe_dict,
+            hardware_context=hw if hw else None,
+            output_path=output,
+        )
+        console.print(f"\n[green]Merged artifact written to: {written}[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed to write merged artifact: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Display summary
+    console.print(f"\n[bold]Merge Summary[/bold]")
+    console.print(f"  Ranks merged: {merged.gpu_count}")
+    if merged.peak_vram_mb:
+        console.print(f"  Peak VRAM (max across ranks): {merged.peak_vram_mb:.0f} MB")
+    if merged.per_rank_peak_vram_mb:
+        console.print(f"  Per-rank peak VRAM: {', '.join(f'{v:.0f}' for v in merged.per_rank_peak_vram_mb)} MB")
+    if merged.straggler_ratio is not None:
+        ratio = merged.straggler_ratio
+        if ratio > 1.2:
+            console.print(f"  [yellow]Straggler ratio: {ratio:.2f}x (>1.2x indicates straggler)[/yellow]")
+        else:
+            console.print(f"  Straggler ratio: {ratio:.2f}x (healthy)")
+    if merged.has_phase_timing:
+        console.print(f"  Phase timing: available (CUDA events)")
+
+
+@app.command()
+def doctor(
+    script: str = typer.Argument(..., help="Python script to analyze (e.g. train.py)"),
+    timeout: int = typer.Option(60, "--timeout", help="Max calibration run time in seconds"),
+    no_run: bool = typer.Option(False, "--no-run", help="Skip calibration run (use existing artifact only)"),
+    no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml"),
+    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed output"),
+):
+    """Full training doctor — diagnose, explain, and fix in one command.
+
+    Orchestrates: AST analysis → Ghost VRAM → calibration run → diagnosis →
+    AI explanation → AI patches. Requires login (Pro tier for AI features).
+    """
+    from alloc.code_analyzer import analyze_script as _analyze_script
+    from alloc.artifact_loader import load_artifact as _load_artifact, find_artifact as _find_artifact
+    from alloc.diagnosis_engine import run_diagnosis, _quick_hw_context
+    from alloc.diagnosis_display import (
+        print_diagnose_rich, print_diagnose_json as _print_diagnose_json,
+    )
+
+    if not os.path.isfile(script):
+        if json_output:
+            _print_json({"error": "File not found: {}".format(script)})
+        else:
+            console.print("[red]File not found: {}[/red]".format(script))
+        raise typer.Exit(1)
+
+    if not script.endswith(".py"):
+        if json_output:
+            _print_json({"error": "Expected a Python file: {}".format(script)})
+        else:
+            console.print("[yellow]Expected a Python file: {}[/yellow]".format(script))
+        raise typer.Exit(1)
+
+    json_data = {} if json_output else None
+    gpu_context = _load_gpu_context(no_config)
+
+    # --- Step 1: AST Analysis ---
+    if not json_output:
+        console.print("[bold cyan]Step 1/6[/bold cyan] AST analysis...")
+    findings = _analyze_script(script)
+    step1_count = len(findings.models) + len(findings.dataloaders) + len(findings.optimizers) + len(findings.distributed) + len(findings.precision)
+    if not json_output:
+        console.print("  Found {} code patterns".format(step1_count))
+
+    # --- Step 2: Ghost VRAM Estimation ---
+    if not json_output:
+        console.print("[bold cyan]Step 2/6[/bold cyan] Ghost VRAM estimation...")
+    ghost_report = None
+    try:
+        from alloc.model_extractor import extract_model_info
+        from alloc.ghost import ghost as ghost_fn
+
+        info = extract_model_info(script, timeout=30)
+        if info and info.param_count > 0:
+            ghost_report = ghost_fn(param_count_b=info.param_count / 1e9 if info.param_count > 100 else info.param_count)
+            if not json_output:
+                console.print("  VRAM estimate: {:.1f} GB".format(ghost_report.total_gb))
+        else:
+            if not json_output:
+                console.print("  [dim]Could not extract model — skipping VRAM estimate[/dim]")
+    except Exception:
+        if not json_output:
+            console.print("  [dim]Ghost scan skipped (model extraction failed)[/dim]")
+
+    # --- Step 3: Calibration Run ---
+    artifact_data = None
+    artifact_path = None
+    if not no_run:
+        if not json_output:
+            console.print("[bold cyan]Step 3/6[/bold cyan] Calibration run ({}s timeout)...".format(timeout))
+        try:
+            from alloc.probe import probe_command
+            from alloc.artifact_writer import write_report
+
+            result = probe_command(
+                ["python", script],
+                timeout_seconds=timeout,
+                calibrate=True,
+            )
+
+            if result.peak_vram_mb > 0:
+                callback_data = _read_callback_data()
+                probe_dict = {
+                    "peak_vram_mb": result.peak_vram_mb,
+                    "avg_gpu_util": result.avg_gpu_util,
+                    "avg_power_watts": result.avg_power_watts,
+                    "duration_seconds": result.duration_seconds,
+                    "samples": result.samples,
+                    "exit_code": result.exit_code,
+                    "probe_mode": result.probe_mode,
+                    "stop_reason": result.stop_reason,
+                    "gpu_name": result.gpu_name,
+                    "gpu_total_vram_mb": result.gpu_total_vram_mb,
+                    "command": "python {}".format(script),
+                }
+                if callback_data:
+                    for key in ("step_time_ms_p50", "step_time_ms_p90", "samples_per_sec"):
+                        val = callback_data.get(key)
+                        if val is not None:
+                            probe_dict[key] = val
+                hw_context_dict = {
+                    "gpu_name": result.gpu_name,
+                    "gpu_total_vram_mb": result.gpu_total_vram_mb,
+                    "num_gpus_detected": result.num_gpus_detected,
+                    "sm_version": result.sm_version,
+                }
+                artifact_path = write_report(
+                    probe_result=probe_dict,
+                    hardware_context=hw_context_dict,
+                )
+                artifact_data = _load_artifact(artifact_path)
+                if not json_output:
+                    console.print("  Peak VRAM: {:.0f} MB, GPU util: {:.0f}%".format(
+                        result.peak_vram_mb, result.avg_gpu_util or 0))
+            else:
+                if not json_output:
+                    console.print("  [yellow]No GPU data captured[/yellow]")
+
+        except Exception as e:
+            if not json_output:
+                console.print("  [yellow]Calibration failed: {}[/yellow]".format(e))
+    else:
+        # Try to find existing artifact
+        if not json_output:
+            console.print("[bold cyan]Step 3/6[/bold cyan] Loading existing artifact...")
+        artifact_path = _find_artifact(".")
+        if artifact_path:
+            artifact_data = _load_artifact(artifact_path)
+            if not json_output and artifact_data:
+                console.print("  Loaded: {}".format(artifact_path))
+        else:
+            if not json_output:
+                console.print("  [dim]No artifact found — diagnosis will be AST-only[/dim]")
+
+    # --- Step 4: Diagnosis (25 rules) ---
+    if not json_output:
+        console.print("[bold cyan]Step 4/6[/bold cyan] Running diagnosis (25 rules)...")
+    hw = _quick_hw_context()
+    if not no_config and gpu_context:
+        fleet = gpu_context.get("fleet", [])
+        if fleet and hw is None:
+            hw = {"gpu_count": len(fleet)}
+
+    diag_result = run_diagnosis(
+        findings,
+        hardware_context=hw,
+        artifact=artifact_data,
+    )
+    if artifact_path:
+        diag_result.artifact_path = artifact_path
+
+    if not json_output:
+        total = diag_result.summary.get("total", 0)
+        crit = diag_result.summary.get("critical", 0)
+        warn = diag_result.summary.get("warning", 0)
+        console.print("  {} findings ({} critical, {} warning)".format(total, crit, warn))
+
+    # Show heuristic findings
+    if not json_output and diag_result.findings:
+        console.print()
+        print_diagnose_rich(diag_result, verbose=verbose)
+
+    # --- Step 5: AI Explanation ---
+    if not json_output:
+        console.print("\n[bold cyan]Step 5/6[/bold cyan] AI explanation...")
+    explain_data = None
+    if diag_result.findings:
+        explain_data = _fetch_explain(diag_result, findings, artifact_data, hw, script, json_output, quiet=json_output)
+        if not json_output and explain_data:
+            _render_explain_rich(explain_data)
+        elif not json_output:
+            console.print("  [dim]Skipped (login required or no findings)[/dim]")
+    else:
+        if not json_output:
+            console.print("  [dim]No findings to explain[/dim]")
+
+    # --- Step 6: AI Fix ---
+    if not json_output:
+        console.print("\n[bold cyan]Step 6/6[/bold cyan] AI code patches...")
+    fix_data = None
+    if diag_result.findings:
+        fix_data = _fetch_fix(diag_result, findings, artifact_data, hw, script, json_output, quiet=json_output)
+        if not json_output and fix_data:
+            _render_fix_rich(fix_data)
+        elif not json_output:
+            console.print("  [dim]Skipped (login required or no findings)[/dim]")
+    else:
+        if not json_output:
+            console.print("  [dim]No findings to fix[/dim]")
+
+    # --- Summary ---
+    if json_output:
+        json_data = {
+            "script": script,
+            "ghost_vram_gb": ghost_report.total_gb if ghost_report else None,
+            "artifact_path": artifact_path,
+            "diagnosis": {
+                "summary": diag_result.summary,
+                "tier": diag_result.tier,
+                "findings_count": len(diag_result.findings),
+            },
+        }
+        if explain_data:
+            json_data["explain"] = explain_data
+        if fix_data:
+            json_data["fix"] = fix_data
+        _print_json(json_data)
+    else:
+        console.print("\n[bold green]Doctor complete.[/bold green]")
+        if ghost_report:
+            console.print("  Ghost VRAM: {:.1f} GB".format(ghost_report.total_gb))
+        if artifact_data and artifact_data.peak_vram_mb:
+            console.print("  Measured VRAM: {:.0f} MB".format(artifact_data.peak_vram_mb))
+        console.print("  Findings: {}".format(len(diag_result.findings)))
+        if explain_data:
+            console.print("  AI explanation: included")
+        if fix_data and fix_data.get("patches"):
+            console.print("  AI patches: {} generated".format(len(fix_data["patches"])))
+        if artifact_path:
+            console.print("  Artifact: {}".format(artifact_path))
+
+
+@app.command()
+def status(
+    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Show last run summary, upload state, and dashboard link."""
+    from alloc.artifact_loader import find_artifact, load_artifact
+
+    token = get_token()
+    api_url = get_api_url()
+
+    out = {
+        "version": __version__,
+        "logged_in": bool(token),
+        "api_url": api_url,
+        "artifact": None,
+        "dashboard_url": None,
+    }
+
+    # Find latest artifact
+    artifact_path = find_artifact()
+    if artifact_path:
+        art = load_artifact(artifact_path)
+        if art:
+            art_info = {
+                "path": artifact_path,
+                "gpu": art.gpu_name,
+                "gpu_count": art.gpu_count,
+                "peak_vram_mb": round(art.peak_vram_mb, 1) if art.peak_vram_mb else None,
+                "avg_gpu_util": round(art.avg_gpu_util, 1) if art.avg_gpu_util else None,
+                "step_time_p50_ms": round(art.step_time_p50_ms, 1) if art.step_time_p50_ms else None,
+                "throughput": round(art.throughput_samples_per_sec, 2) if art.throughput_samples_per_sec else None,
+                "duration_s": round(art.duration_s, 1) if art.duration_s else None,
+                "exit_code": art.exit_code,
+                "is_oom": art.is_oom,
+                "has_phase_timing": art.has_phase_timing,
+                "command": art.command,
+            }
+            out["artifact"] = art_info
+
+    # Dashboard URL (convention: alloclabs.com/dashboard/runs)
+    dashboard_base = "https://www.alloclabs.com/dashboard"
+    out["dashboard_url"] = f"{dashboard_base}/runs"
+
+    if json_output:
+        _print_json(out)
+        return
+
+    # Rich output
+    console.print(f"[bold]alloc[/bold] v{__version__}")
+    console.print()
+
+    # Auth
+    if token:
+        console.print("[green]Logged in[/green]")
+    else:
+        console.print("[yellow]Not logged in[/yellow] — run [bold]alloc login[/bold]")
+
+    console.print()
+
+    # Latest artifact
+    if out["artifact"]:
+        a = out["artifact"]
+        console.print("[bold]Last run:[/bold]")
+        if a["command"]:
+            console.print(f"  Command: [dim]{a['command']}[/dim]")
+        console.print(f"  Artifact: [dim]{a['path']}[/dim]")
+        if a["gpu"]:
+            gpu_str = a["gpu"]
+            if a["gpu_count"] and a["gpu_count"] > 1:
+                gpu_str = f"{a['gpu_count']}x {gpu_str}"
+            console.print(f"  GPU: {gpu_str}")
+        if a["peak_vram_mb"]:
+            console.print(f"  Peak VRAM: {a['peak_vram_mb']:.0f} MB")
+        if a["avg_gpu_util"] is not None:
+            console.print(f"  GPU util: {a['avg_gpu_util']:.0f}%")
+        if a["step_time_p50_ms"]:
+            console.print(f"  Step time (p50): {a['step_time_p50_ms']:.0f} ms")
+        if a["throughput"]:
+            console.print(f"  Throughput: {a['throughput']:.1f} samples/sec")
+        if a["duration_s"]:
+            m, s = divmod(int(a["duration_s"]), 60)
+            console.print(f"  Duration: {m}m {s}s")
+        if a["is_oom"]:
+            console.print("  [red]OOM detected[/red]")
+        elif a["exit_code"] is not None and a["exit_code"] != 0:
+            console.print(f"  [yellow]Exit code: {a['exit_code']}[/yellow]")
+        if a["has_phase_timing"]:
+            console.print("  Phase timing: [green]available[/green]")
+    else:
+        console.print("[dim]No artifact found in current directory.[/dim]")
+        console.print("[dim]Run: alloc run python train.py[/dim]")
+
+    console.print()
+
+    # Upload hint
+    if out["artifact"] and not token:
+        console.print("[dim]Upload to dashboard: alloc login && alloc upload " + out["artifact"]["path"] + "[/dim]")
+    elif out["artifact"] and token:
+        console.print(f"[dim]Upload: alloc upload {out['artifact']['path']}[/dim]")
+        console.print(f"[dim]Dashboard: {out['dashboard_url']}[/dim]")
+    elif token:
+        console.print(f"[dim]Dashboard: {out['dashboard_url']}[/dim]")
 
 
 @app.command()
