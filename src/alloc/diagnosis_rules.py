@@ -453,6 +453,7 @@ def rule_mem005_no_torch_compile(
         estimated_impact="~10-30% speedup depending on model architecture",
         confidence="low",
         doc_url="https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html",
+        evidence={},
     )]
 
 

@@ -59,6 +59,7 @@ def _extract_architecture(model):
         info["seq_length"] = (
             getattr(config, "max_position_embeddings", None)
             or getattr(config, "n_positions", None)
+            or getattr(config, "max_seq_len", None)
         )
         info["model_type"] = getattr(config, "model_type", None)
     return info
