@@ -9,6 +9,8 @@ All thresholds cite public PyTorch/NVIDIA documentation. No proprietary logic.
 
 from __future__ import annotations
 
+import math
+import os
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -79,12 +81,15 @@ def rule_dl001_num_workers_low(
     """DataLoader num_workers too low.
 
     Fires when num_workers < recommended minimum.
-    Recommended: max(4, gpu_count * 2) per PyTorch data loading tutorial.
+    Recommended: max(4, min(gpu_count * 2, per_gpu_cores)) — capped by CPU
+    cores to avoid oversubscription.
     Ref: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
     """
     results = []
     gpu_count = (hw or {}).get("gpu_count", 1) or 1
-    recommended = max(4, gpu_count * 2)
+    cpu_cores = os.cpu_count() or 4
+    per_gpu_cores = max(1, cpu_cores // max(gpu_count, 1))
+    recommended = max(4, min(gpu_count * 2, per_gpu_cores))
 
     for dl in findings.dataloaders:
         if dl.num_workers is None:
@@ -114,11 +119,11 @@ def rule_dl001_num_workers_low(
             current_value=f"num_workers={dl.num_workers}",
             suggested_value=f"num_workers={recommended}",
             suggested_code=suggested_code,
-            rationale=f"With {gpu_count} GPU(s), recommended minimum is {recommended} workers to keep the GPU fed.",
+            rationale=f"With {gpu_count} GPU(s) and {cpu_cores} CPU cores ({per_gpu_cores} per GPU), recommended minimum is {recommended} workers.",
             estimated_impact="~15-25% faster data loading",
             confidence=confidence,
             doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
-            evidence={"num_workers": str(dl.num_workers), "gpu_count": str(gpu_count), "recommended": str(recommended)},
+            evidence={"num_workers": str(dl.num_workers), "gpu_count": str(gpu_count), "cpu_cores": str(cpu_cores), "per_gpu_cores": str(per_gpu_cores), "recommended": str(recommended)},
         ))
 
     return results
@@ -1060,49 +1065,138 @@ def rule_thru003_reduce_grad_accum(
     hw: Optional[Dict] = None,
     artifact: Optional[ArtifactData] = None,
 ) -> List[Diagnosis]:
-    """Reduce gradient accumulation steps when throughput is low.
+    """Increase per-step batch and reduce gradient accumulation steps.
 
-    When grad_accum is detected in the AST and throughput seems low
-    relative to GPU utilization, suggest reducing accumulation steps
-    to decrease wall-clock time per effective step.
+    When GPU utilization is low AND gradient accumulation is active (>=2),
+    the per-microbatch is likely too small to saturate the GPU. Suggest
+    increasing batch_size and proportionally reducing accumulation steps
+    to keep the same effective batch but fill the GPU better per step.
+
+    This is the inverse of DIST003 (which suggests *adding* accumulation
+    for small batches). THRU003 fires when accum is already present but
+    each micro-batch under-utilizes the hardware.
+
+    Threshold: avg_gpu_util < 60% — below this, GPU is clearly idle between
+    micro-batches.
 
     Ref: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
     """
     if artifact is None:
         return []
 
-    # Need throughput data
-    sps = artifact.throughput_samples_per_sec
     avg_util = artifact.avg_gpu_util
-    if sps is None or avg_util is None:
+    if avg_util is None:
         return []
 
-    # Only fire if GPU utilization is low (suggesting wasted cycles)
-    if avg_util >= 70:
+    # Only fire when GPU is clearly underutilized
+    if avg_util >= 60:
         return []
 
-    # Check for gradient accumulation via AST-extracted field
-    has_grad_accum = findings.gradient_accumulation_steps is not None
-
-    if not has_grad_accum:
+    # Need gradient accumulation >= 2 from AST
+    accum_steps = findings.gradient_accumulation_steps
+    if accum_steps is None or accum_steps < 2:
         return []
+
+    # Build evidence
+    ev = {
+        "avg_gpu_util_pct": str(round(avg_util)),
+        "gradient_accumulation_steps": str(accum_steps),
+    }
+
+    # Add phase timing evidence when available
+    if artifact.has_phase_timing and artifact.phase_forward_ms_p50 is not None:
+        ev["phase_forward_ms_p50"] = str(round(artifact.phase_forward_ms_p50, 1))
+    if artifact.has_phase_timing and artifact.phase_backward_ms_p50 is not None:
+        ev["phase_backward_ms_p50"] = str(round(artifact.phase_backward_ms_p50, 1))
 
     return [Diagnosis(
         rule_id="THRU003",
-        severity="info",
+        severity="warning",
         category="throughput",
-        title="Consider reducing gradient accumulation steps",
+        title="Per-microbatch too small for GPU — reduce gradient accumulation",
         file_path=findings.script_path,
         line_number=0,
         current_code="",
-        current_value=f"Throughput {sps:.1f} samples/sec, GPU utilization {avg_util:.0f}%",
-        suggested_value="Reduce gradient_accumulation_steps if VRAM allows larger batch",
+        current_value=f"gradient_accumulation_steps={accum_steps}, GPU utilization {avg_util:.0f}%",
+        suggested_value=f"Increase batch_size by {min(accum_steps, 4)}x and reduce gradient_accumulation_steps proportionally",
         suggested_code="",
-        rationale=f"Throughput is {sps:.1f} samples/sec with {avg_util:.0f}% GPU utilization. If VRAM allows, increasing batch_size and reducing accumulation steps decreases wall-clock time.",
-        estimated_impact="~10-20% throughput improvement",
-        confidence="low",
+        rationale=f"GPU utilization is only {avg_util:.0f}% with {accum_steps} accumulation steps. Each micro-batch is too small to saturate the GPU. Increase batch_size and reduce accumulation steps proportionally to keep the same effective batch size while improving hardware utilization.",
+        estimated_impact="~15-30% throughput improvement",
+        confidence="medium",
         doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
-        evidence={"throughput_sps": str(round(sps, 1)), "avg_gpu_util_pct": str(round(avg_util)), "gradient_accumulation_steps": str(findings.gradient_accumulation_steps)},
+        evidence=ev,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# XS003: Communication overhead detection (cross-signal, world-size scaled)
+# ---------------------------------------------------------------------------
+
+def rule_xs003_comm_overhead(
+    findings: CodeFindings,
+    hw: Optional[Dict] = None,
+    artifact: Optional[ArtifactData] = None,
+) -> List[Diagnosis]:
+    """Communication overhead detected — backward >> forward suggests all-reduce bound.
+
+    Requires phase timing from CUDA events + multi-GPU setup. The backward phase
+    in distributed training includes both gradient computation AND all-reduce
+    communication. When backward/forward ratio exceeds a world-size-scaled
+    threshold, training is likely communication-bound.
+
+    Threshold scales with world_size: 1.5 + 0.3 * log2(world_size)
+      2 GPUs: 1.8,  4 GPUs: 2.1,  8 GPUs: 2.4,  64 GPUs: 3.3
+
+    This accounts for the fact that all-reduce cost grows with participant count.
+
+    Ref: https://pytorch.org/tutorials/intermediate/ddp_tutorial.html
+    """
+    if artifact is None or not artifact.has_phase_timing:
+        return []
+
+    # Need multi-GPU
+    gpu_count = (hw or {}).get("gpu_count", 1) or 1
+    if gpu_count < 2:
+        return []
+
+    # Need both forward and backward phase timing
+    fwd_p50 = artifact.phase_forward_ms_p50
+    bwd_p50 = artifact.phase_backward_ms_p50
+    if fwd_p50 is None or bwd_p50 is None or fwd_p50 <= 0:
+        return []
+
+    ratio = bwd_p50 / fwd_p50
+    threshold = 1.5 + 0.3 * math.log2(gpu_count)
+
+    if ratio <= threshold:
+        return []
+
+    overhead_pct = round((ratio - 1.0) * 100 / ratio, 0)  # comm fraction estimate
+
+    ev = {
+        "phase_forward_ms_p50": str(round(fwd_p50, 1)),
+        "phase_backward_ms_p50": str(round(bwd_p50, 1)),
+        "backward_forward_ratio": str(round(ratio, 2)),
+        "threshold": str(round(threshold, 2)),
+        "gpu_count": str(gpu_count),
+    }
+
+    return [Diagnosis(
+        rule_id="XS003",
+        severity="warning",
+        category="distributed",
+        title=f"Communication overhead detected — backward/forward ratio {ratio:.1f}x",
+        file_path=findings.script_path,
+        line_number=0,
+        current_code="",
+        current_value=f"backward={bwd_p50:.1f}ms, forward={fwd_p50:.1f}ms (ratio {ratio:.1f}x, threshold {threshold:.1f}x for {gpu_count} GPUs)",
+        suggested_value="Enable gradient compression, overlap comm with compute, or reduce world size",
+        suggested_code="",
+        rationale=f"Backward phase ({bwd_p50:.1f}ms) is {ratio:.1f}x longer than forward ({fwd_p50:.1f}ms) across {gpu_count} GPUs, exceeding the {threshold:.1f}x threshold. This suggests ~{overhead_pct:.0f}% of backward time is all-reduce communication. Consider: gradient compression (PowerSGD), communication/computation overlap (FSDP backward_prefetch), or reducing world size if scaling efficiency is poor.",
+        estimated_impact="~10-25% faster training depending on optimization",
+        confidence="medium",
+        doc_url="https://pytorch.org/tutorials/intermediate/ddp_tutorial.html",
+        evidence=ev,
     )]
 
 
@@ -1640,6 +1734,7 @@ ALL_RULES = [
     rule_dist003_gradient_accumulation,
     rule_thru003_reduce_grad_accum,
     # Cross-signal rules (AST + runtime, 3-arg)
+    rule_xs003_comm_overhead,
     rule_xs004_mixed_precision_effective,
     # Straggler detection (3-arg)
     rule_strag001_straggler,

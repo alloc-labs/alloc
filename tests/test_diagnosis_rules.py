@@ -1,6 +1,7 @@
 """Tests for diagnosis_rules.py — Phase 1 + Phase 2 diagnosis rules."""
 
 import textwrap
+from unittest.mock import patch
 
 from alloc.artifact_loader import ArtifactData
 from alloc.code_analyzer import analyze_script
@@ -24,6 +25,7 @@ from alloc.diagnosis_rules import (
     rule_dist005_data_parallel,
     rule_thru001_cudnn_benchmark,
     rule_thru003_reduce_grad_accum,
+    rule_xs003_comm_overhead,
     rule_xs004_mixed_precision_effective,
     rule_strag001_straggler,
     rule_reg001_step_time_regression,
@@ -53,7 +55,8 @@ HW_V100 = {"gpu_name": "NVIDIA V100", "gpu_count": 1, "sm_version": "7.0"}
 # DL001: num_workers too low
 # ---------------------------------------------------------------------------
 
-def test_dl001_fires(tmp_path):
+@patch("alloc.diagnosis_rules.os.cpu_count", return_value=32)
+def test_dl001_fires(mock_cpu, tmp_path):
     findings = _analyze(tmp_path, """
         from torch.utils.data import DataLoader
         loader = DataLoader(ds, num_workers=2)
@@ -62,10 +65,12 @@ def test_dl001_fires(tmp_path):
     assert len(diags) == 1
     assert diags[0].rule_id == "DL001"
     assert diags[0].severity == "critical"
+    # 32 cores / 4 GPUs = 8 per GPU, min(8, 8)=8, max(4, 8)=8
     assert "num_workers=8" in diags[0].suggested_value
 
 
-def test_dl001_ok(tmp_path):
+@patch("alloc.diagnosis_rules.os.cpu_count", return_value=32)
+def test_dl001_ok(mock_cpu, tmp_path):
     findings = _analyze(tmp_path, """
         from torch.utils.data import DataLoader
         loader = DataLoader(ds, num_workers=8)
@@ -74,7 +79,8 @@ def test_dl001_ok(tmp_path):
     assert len(diags) == 0
 
 
-def test_dl001_no_hw(tmp_path):
+@patch("alloc.diagnosis_rules.os.cpu_count", return_value=32)
+def test_dl001_no_hw(mock_cpu, tmp_path):
     findings = _analyze(tmp_path, """
         from torch.utils.data import DataLoader
         loader = DataLoader(ds, num_workers=2)
@@ -1007,6 +1013,185 @@ def test_upg003_skips_already_fsdp(tmp_path):
     """)
     diags = rule_upg003_deepspeed_single_node(findings, HW_4GPU)
     assert len(diags) == 0
+
+
+# ---------------------------------------------------------------------------
+# DL001: CPU-aware num_workers (new tests)
+# ---------------------------------------------------------------------------
+
+@patch("alloc.diagnosis_rules.os.cpu_count", return_value=8)
+def test_dl001_cpu_aware_low_cores(mock_cpu, tmp_path):
+    """With 8 CPU cores and 8 GPUs, per_gpu_cores=1, recommended=max(4,min(16,1))=4."""
+    hw_8gpu = {"gpu_name": "NVIDIA A100", "gpu_count": 8, "sm_version": "8.0"}
+    findings = _analyze(tmp_path, """
+        from torch.utils.data import DataLoader
+        loader = DataLoader(ds, num_workers=2)
+    """)
+    diags = rule_dl001_num_workers_low(findings, hw_8gpu)
+    assert len(diags) == 1
+    assert "num_workers=4" in diags[0].suggested_value
+    assert diags[0].evidence["cpu_cores"] == "8"
+    assert diags[0].evidence["per_gpu_cores"] == "1"
+
+
+@patch("alloc.diagnosis_rules.os.cpu_count", return_value=80)
+def test_dl001_cpu_aware_high_cores(mock_cpu, tmp_path):
+    """With 80 CPU cores and 4 GPUs, per_gpu_cores=20, recommended=max(4,min(8,20))=8."""
+    findings = _analyze(tmp_path, """
+        from torch.utils.data import DataLoader
+        loader = DataLoader(ds, num_workers=2)
+    """)
+    diags = rule_dl001_num_workers_low(findings, HW_4GPU)
+    assert len(diags) == 1
+    assert "num_workers=8" in diags[0].suggested_value
+    assert diags[0].evidence["cpu_cores"] == "80"
+    assert diags[0].evidence["per_gpu_cores"] == "20"
+
+
+# ---------------------------------------------------------------------------
+# THRU003: Grad accum + low utilization (rewritten)
+# ---------------------------------------------------------------------------
+
+def test_thru003_fires(tmp_path):
+    """THRU003 fires when GPU underutilized AND grad accum >= 2."""
+    findings = _analyze(tmp_path, """
+        from transformers import Trainer, TrainingArguments
+        args = TrainingArguments(output_dir="./out", gradient_accumulation_steps=4)
+    """)
+    artifact = ArtifactData(avg_gpu_util=40.0)
+    diags = rule_thru003_reduce_grad_accum(findings, HW_1GPU, artifact)
+    assert len(diags) == 1
+    assert diags[0].rule_id == "THRU003"
+    assert diags[0].severity == "warning"
+    assert diags[0].confidence == "medium"
+    assert "4" in diags[0].evidence["gradient_accumulation_steps"]
+
+
+def test_thru003_ok_high_util(tmp_path):
+    """THRU003 does not fire when GPU utilization >= 60%."""
+    findings = _analyze(tmp_path, """
+        from transformers import Trainer, TrainingArguments
+        args = TrainingArguments(output_dir="./out", gradient_accumulation_steps=4)
+    """)
+    artifact = ArtifactData(avg_gpu_util=65.0)
+    diags = rule_thru003_reduce_grad_accum(findings, HW_1GPU, artifact)
+    assert len(diags) == 0
+
+
+def test_thru003_no_accum(tmp_path):
+    """THRU003 does not fire without gradient accumulation."""
+    findings = _analyze(tmp_path, """
+        from transformers import Trainer, TrainingArguments
+        args = TrainingArguments(output_dir="./out")
+    """)
+    artifact = ArtifactData(avg_gpu_util=40.0)
+    diags = rule_thru003_reduce_grad_accum(findings, HW_1GPU, artifact)
+    assert len(diags) == 0
+
+
+def test_thru003_accum_one(tmp_path):
+    """THRU003 does not fire when gradient_accumulation_steps=1."""
+    findings = _analyze(tmp_path, """
+        from transformers import Trainer, TrainingArguments
+        args = TrainingArguments(output_dir="./out", gradient_accumulation_steps=1)
+    """)
+    artifact = ArtifactData(avg_gpu_util=40.0)
+    diags = rule_thru003_reduce_grad_accum(findings, HW_1GPU, artifact)
+    assert len(diags) == 0
+
+
+def test_thru003_with_phase_timing(tmp_path):
+    """THRU003 includes phase timing evidence when available."""
+    findings = _analyze(tmp_path, """
+        from transformers import Trainer, TrainingArguments
+        args = TrainingArguments(output_dir="./out", gradient_accumulation_steps=8)
+    """)
+    artifact = ArtifactData(
+        avg_gpu_util=30.0,
+        has_phase_timing=True,
+        phase_forward_ms_p50=10.0,
+        phase_backward_ms_p50=25.0,
+    )
+    diags = rule_thru003_reduce_grad_accum(findings, HW_1GPU, artifact)
+    assert len(diags) == 1
+    assert "phase_forward_ms_p50" in diags[0].evidence
+    assert "phase_backward_ms_p50" in diags[0].evidence
+
+
+# ---------------------------------------------------------------------------
+# XS003: Communication overhead detection
+# ---------------------------------------------------------------------------
+
+def test_xs003_fires_comm_bound(tmp_path):
+    """XS003 fires when backward/forward ratio exceeds world-size-scaled threshold."""
+    findings = _analyze(tmp_path, """import torch""")
+    artifact = ArtifactData(
+        has_phase_timing=True,
+        phase_forward_ms_p50=50.0,
+        phase_backward_ms_p50=150.0,  # ratio=3.0, threshold for 8 GPUs=2.4
+    )
+    hw_8gpu = {"gpu_name": "NVIDIA A100", "gpu_count": 8, "sm_version": "8.0"}
+    diags = rule_xs003_comm_overhead(findings, hw_8gpu, artifact)
+    assert len(diags) == 1
+    assert diags[0].rule_id == "XS003"
+    assert diags[0].severity == "warning"
+    assert diags[0].category == "distributed"
+    assert "3.0x" in diags[0].title
+
+
+def test_xs003_ok_balanced(tmp_path):
+    """XS003 does not fire when backward/forward ratio is within threshold."""
+    findings = _analyze(tmp_path, """import torch""")
+    artifact = ArtifactData(
+        has_phase_timing=True,
+        phase_forward_ms_p50=50.0,
+        phase_backward_ms_p50=90.0,  # ratio=1.8, threshold for 4 GPUs=2.1
+    )
+    diags = rule_xs003_comm_overhead(findings, HW_4GPU, artifact)
+    assert len(diags) == 0
+
+
+def test_xs003_single_gpu_no_fire(tmp_path):
+    """XS003 does not fire on single GPU — no inter-GPU communication."""
+    findings = _analyze(tmp_path, """import torch""")
+    artifact = ArtifactData(
+        has_phase_timing=True,
+        phase_forward_ms_p50=50.0,
+        phase_backward_ms_p50=200.0,
+    )
+    diags = rule_xs003_comm_overhead(findings, HW_1GPU, artifact)
+    assert len(diags) == 0
+
+
+def test_xs003_no_phase_timing(tmp_path):
+    """XS003 does not fire without phase timing data."""
+    findings = _analyze(tmp_path, """import torch""")
+    artifact = ArtifactData(has_phase_timing=False, avg_gpu_util=90.0)
+    diags = rule_xs003_comm_overhead(findings, HW_4GPU, artifact)
+    assert len(diags) == 0
+
+
+def test_xs003_threshold_scales(tmp_path):
+    """Verify threshold math: 1.5 + 0.3*log2(N)."""
+    import math
+    # 2 GPUs: 1.5 + 0.3*1 = 1.8
+    assert abs((1.5 + 0.3 * math.log2(2)) - 1.8) < 0.01
+    # 8 GPUs: 1.5 + 0.3*3 = 2.4
+    assert abs((1.5 + 0.3 * math.log2(8)) - 2.4) < 0.01
+    # 64 GPUs: 1.5 + 0.3*6 = 3.3
+    assert abs((1.5 + 0.3 * math.log2(64)) - 3.3) < 0.01
+
+    # ratio=2.5 should fire for 8 GPUs (threshold=2.4) but not 64 GPUs (threshold=3.3)
+    findings = _analyze(tmp_path, """import torch""")
+    artifact = ArtifactData(
+        has_phase_timing=True,
+        phase_forward_ms_p50=40.0,
+        phase_backward_ms_p50=100.0,  # ratio=2.5
+    )
+    hw_8 = {"gpu_name": "NVIDIA A100", "gpu_count": 8, "sm_version": "8.0"}
+    hw_64 = {"gpu_name": "NVIDIA A100", "gpu_count": 64, "sm_version": "8.0"}
+    assert len(rule_xs003_comm_overhead(findings, hw_8, artifact)) == 1
+    assert len(rule_xs003_comm_overhead(findings, hw_64, artifact)) == 0
 
 
 # ---------------------------------------------------------------------------
