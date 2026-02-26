@@ -13,7 +13,8 @@
       "tf32_tflops": 495,
       "architecture": "Hopper",
       "tdp_watts": 700,
-      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 900, "pcie_gen": 5 }
+      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 900, "pcie_gen": 5 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA H200 datasheet: 1979 sparse / 2 = 989.5"
     },
     "nvidia-h100-sxm-80gb": {
       "display_name": "H100-80GB",
@@ -26,7 +27,8 @@
       "tf32_tflops": 495,
       "architecture": "Hopper",
       "tdp_watts": 700,
-      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 900, "pcie_gen": 5 }
+      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 900, "pcie_gen": 5 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA H100 SXM datasheet: 1979 sparse / 2 = 989.5"
     },
     "nvidia-h100-nvl-94gb": {
       "display_name": "H100-NVL",
@@ -39,7 +41,8 @@
       "tf32_tflops": 418,
       "architecture": "Hopper",
       "tdp_watts": 310,
-      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 600, "pcie_gen": 5 }
+      "interconnect": { "nvlink_gen": 4, "nvlink_bw_gbps": 600, "pcie_gen": 5 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA H100 NVL datasheet: ~1671 sparse / 2 = 835.5"
     },
     "nvidia-a100-sxm-80gb": {
       "display_name": "A100-80GB",
@@ -52,7 +55,8 @@
       "tf32_tflops": 156,
       "architecture": "Ampere",
       "tdp_watts": 400,
-      "interconnect": { "nvlink_gen": 3, "nvlink_bw_gbps": 600, "pcie_gen": 4 }
+      "interconnect": { "nvlink_gen": 3, "nvlink_bw_gbps": 600, "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA A100 datasheet: 624 sparse / 2 = 312"
     },
     "nvidia-a100-40gb": {
       "display_name": "A100-40GB",
@@ -65,7 +69,8 @@
       "tf32_tflops": 156,
       "architecture": "Ampere",
       "tdp_watts": 400,
-      "interconnect": { "nvlink_gen": 3, "nvlink_bw_gbps": 600, "pcie_gen": 4 }
+      "interconnect": { "nvlink_gen": 3, "nvlink_bw_gbps": 600, "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA A100 datasheet: 624 sparse / 2 = 312"
     },
     "nvidia-a10g-24gb": {
       "display_name": "A10G",
@@ -78,7 +83,8 @@
       "tf32_tflops": 62.5,
       "architecture": "Ampere",
       "tdp_watts": 300,
-      "interconnect": { "pcie_gen": 4 }
+      "interconnect": { "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA A10G datasheet: 250 sparse / 2 = 125"
     },
     "nvidia-l40s-48gb": {
       "display_name": "L40S",
@@ -91,7 +97,8 @@
       "tf32_tflops": 183,
       "architecture": "Ada Lovelace",
       "tdp_watts": 350,
-      "interconnect": { "pcie_gen": 4 }
+      "interconnect": { "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA L40S datasheet: ~733 sparse / 2 = 366.5 (rounded to 362)"
     },
     "nvidia-l4-24gb": {
       "display_name": "L4",
@@ -104,7 +111,8 @@
       "tf32_tflops": 60.5,
       "architecture": "Ada Lovelace",
       "tdp_watts": 72,
-      "interconnect": { "pcie_gen": 4 }
+      "interconnect": { "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA L4 datasheet: 242 sparse / 2 = 121"
     },
     "nvidia-t4-16gb": {
       "display_name": "T4",
@@ -117,7 +125,8 @@
       "tf32_tflops": 0,
       "architecture": "Turing",
       "tdp_watts": 70,
-      "interconnect": { "pcie_gen": 3 }
+      "interconnect": { "pcie_gen": 3 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA T4 datasheet: 65 TFLOPS (no sparsity on Turing)"
     },
     "nvidia-v100-32gb": {
       "display_name": "V100-32GB",
@@ -130,7 +139,8 @@
       "tf32_tflops": 0,
       "architecture": "Volta",
       "tdp_watts": 300,
-      "interconnect": { "nvlink_gen": 2, "nvlink_bw_gbps": 300, "pcie_gen": 3 }
+      "interconnect": { "nvlink_gen": 2, "nvlink_bw_gbps": 300, "pcie_gen": 3 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA V100 datasheet: 125 TFLOPS (no sparsity on Volta)"
     },
     "nvidia-v100-16gb": {
       "display_name": "V100-16GB",
@@ -143,7 +153,8 @@
       "tf32_tflops": 0,
       "architecture": "Volta",
       "tdp_watts": 300,
-      "interconnect": { "nvlink_gen": 2, "nvlink_bw_gbps": 300, "pcie_gen": 3 }
+      "interconnect": { "nvlink_gen": 2, "nvlink_bw_gbps": 300, "pcie_gen": 3 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA V100 datasheet: 125 TFLOPS (no sparsity on Volta)"
     },
     "nvidia-rtx4090-24gb": {
       "display_name": "RTX-4090",
@@ -156,7 +167,8 @@
       "tf32_tflops": 82.6,
       "architecture": "Ada Lovelace",
       "tdp_watts": 450,
-      "interconnect": { "pcie_gen": 4 }
+      "interconnect": { "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA RTX 4090 datasheet: 330.3 sparse / 2 = 165.15"
     },
     "nvidia-rtx3090-24gb": {
       "display_name": "RTX-3090",
@@ -169,7 +181,8 @@
       "tf32_tflops": 71,
       "architecture": "Ampere",
       "tdp_watts": 350,
-      "interconnect": { "pcie_gen": 4 }
+      "interconnect": { "pcie_gen": 4 },
+      "_tflops_note": "Dense Tensor Core fp16. NVIDIA RTX 3090 datasheet: 284 sparse / 2 = 142"
     }
   }
 }
