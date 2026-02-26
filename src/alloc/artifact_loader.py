@@ -48,6 +48,9 @@ class ArtifactData:
     phase_dataloader_ms_p90: Optional[float] = None
     has_phase_timing: bool = False
 
+    # Communication overhead (estimated from phase timing in distributed training)
+    comm_overhead_pct: Optional[float] = None
+
     # Per-rank data (from distributed callbacks)
     per_rank_peak_vram_mb: Optional[List[float]] = None
     per_rank_step_times_ms: Optional[List[List[float]]] = None
@@ -169,6 +172,7 @@ def _parse_artifact(raw: dict) -> ArtifactData:
     data.phase_dataloader_ms_p50 = _float_or_none(probe.get("phase_dataloader_ms_p50"))
     data.phase_dataloader_ms_p90 = _float_or_none(probe.get("phase_dataloader_ms_p90"))
     data.has_phase_timing = bool(probe.get("has_phase_timing"))
+    data.comm_overhead_pct = _float_or_none(probe.get("comm_overhead_pct"))
 
     # Architecture metadata (from callback introspection)
     data.architecture_type = probe.get("architecture_type")
@@ -299,6 +303,7 @@ def merge_artifacts(paths: List[str]) -> Optional[ArtifactData]:
     merged.phase_optimizer_ms_p90 = artifacts[0].phase_optimizer_ms_p90
     merged.phase_dataloader_ms_p50 = artifacts[0].phase_dataloader_ms_p50
     merged.phase_dataloader_ms_p90 = artifacts[0].phase_dataloader_ms_p90
+    merged.comm_overhead_pct = artifacts[0].comm_overhead_pct
 
     # Straggler detection: ratio of slowest to fastest rank by step time p50
     p50s = [a.step_time_p50_ms for a in artifacts if a.step_time_p50_ms is not None]

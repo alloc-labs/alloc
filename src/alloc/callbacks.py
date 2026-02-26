@@ -291,6 +291,15 @@ def _build_sidecar(
                 data["phase_{}_ms_p50".format(phase_name)] = ps.get("p50")
                 data["phase_{}_ms_p90".format(phase_name)] = ps.get("p90")
 
+    # Communication overhead estimate (distributed + phase timing)
+    # In distributed training, backward phase includes gradient all-reduce.
+    # Overhead ≈ (backward - forward) / backward × 100.
+    if is_distributed and phase_stats:
+        fwd = (phase_stats.get("forward") or {}).get("p50")
+        bwd = (phase_stats.get("backward") or {}).get("p50")
+        if fwd is not None and bwd is not None and bwd > fwd > 0:
+            data["comm_overhead_pct"] = round((bwd - fwd) / bwd * 100, 1)
+
     # Architecture metadata from model/optimizer introspection
     if architecture_info:
         for key in ("architecture_type", "optimizer_type", "fine_tuning_method",

@@ -295,6 +295,16 @@ class TestPhaseTimingFields:
         assert data.has_phase_timing is False
         assert data.phase_forward_ms_p50 is None
 
+    def test_comm_overhead_pct_parsed(self):
+        raw = {"probe": {"comm_overhead_pct": 42.5, "has_phase_timing": True}}
+        data = _parse_artifact(raw)
+        assert data.comm_overhead_pct == 42.5
+
+    def test_comm_overhead_pct_none_when_absent(self):
+        raw = {"probe": {"peak_vram_mb": 1000}}
+        data = _parse_artifact(raw)
+        assert data.comm_overhead_pct is None
+
     def test_step_times_raw_parsed(self):
         raw = {"probe": {"step_times_raw": [100.0, 110.0, 105.0]}}
         data = _parse_artifact(raw)
@@ -507,6 +517,25 @@ class TestMergeArtifacts:
         assert merged.has_phase_timing is True
         assert merged.phase_forward_ms_p50 == 40.0
         assert merged.phase_backward_ms_p50 == 35.0
+
+    def test_merge_preserves_comm_overhead_pct(self, tmp_path):
+        """comm_overhead_pct from rank 0 should be preserved in merged artifact."""
+        probe = {
+            "peak_vram_mb": 30000,
+            "step_time_ms_p50": 100.0,
+            "has_phase_timing": True,
+            "comm_overhead_pct": 33.3,
+            "gpu_name": "NVIDIA A100",
+        }
+        paths = []
+        for i in range(4):
+            p = str(tmp_path / f"rank{i}.json.gz")
+            with gzip.open(p, "wt") as f:
+                json.dump({"probe": {**probe, "rank": i}}, f)
+            paths.append(p)
+
+        merged = merge_artifacts(paths)
+        assert merged.comm_overhead_pct == 33.3
 
     def test_merge_preserves_architecture_metadata(self, tmp_path):
         """Architecture metadata from rank 0 should be preserved in merged artifact."""

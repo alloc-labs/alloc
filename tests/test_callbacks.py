@@ -639,6 +639,56 @@ class TestBuildSidecarPhaseTimimg:
         assert "phase_backward_ms_p50" not in data
 
 
+class TestBuildSidecarCommOverhead:
+    def test_comm_overhead_distributed_with_phases(self):
+        """comm_overhead_pct computed when distributed + phase timing."""
+        phase_stats = {
+            "forward": {"p50": 20.0, "p90": 25.0},
+            "backward": {"p50": 60.0, "p90": 70.0},
+        }
+        data = _build_sidecar(
+            "test", 10, [100.0], 8,
+            is_distributed=True, rank=0, world_size=4,
+            phase_stats=phase_stats,
+        )
+        # (60 - 20) / 60 * 100 = 66.7%
+        assert data["comm_overhead_pct"] == 66.7
+
+    def test_comm_overhead_not_distributed(self):
+        """comm_overhead_pct NOT computed for single-GPU (not distributed)."""
+        phase_stats = {
+            "forward": {"p50": 20.0, "p90": 25.0},
+            "backward": {"p50": 60.0, "p90": 70.0},
+        }
+        data = _build_sidecar(
+            "test", 10, [100.0], 8,
+            is_distributed=False,
+            phase_stats=phase_stats,
+        )
+        assert "comm_overhead_pct" not in data
+
+    def test_comm_overhead_no_phase_stats(self):
+        """comm_overhead_pct NOT computed without phase timing."""
+        data = _build_sidecar(
+            "test", 10, [100.0], 8,
+            is_distributed=True, rank=0, world_size=4,
+        )
+        assert "comm_overhead_pct" not in data
+
+    def test_comm_overhead_backward_equals_forward(self):
+        """comm_overhead_pct NOT computed when backward <= forward."""
+        phase_stats = {
+            "forward": {"p50": 30.0, "p90": 35.0},
+            "backward": {"p50": 30.0, "p90": 35.0},
+        }
+        data = _build_sidecar(
+            "test", 10, [100.0], 8,
+            is_distributed=True, rank=0, world_size=4,
+            phase_stats=phase_stats,
+        )
+        assert "comm_overhead_pct" not in data
+
+
 class TestCudaAvailability:
     def test_try_cuda_not_available(self):
         from alloc.callbacks import _try_cuda_available
