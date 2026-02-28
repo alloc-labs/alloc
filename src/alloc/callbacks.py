@@ -645,6 +645,8 @@ def _write_full_artifact(monitor, sidecar_data, step_times_raw=None):
             "architecture_type", "optimizer_type", "fine_tuning_method",
             "gradient_checkpointing", "model_type", "attention_type",
             "param_count", "trainable_param_count",
+            # Distributed signals (P3.5-C)
+            "comm_overhead_pct",
         ]
         for key in merge_keys:
             val = sidecar_data.get(key)
