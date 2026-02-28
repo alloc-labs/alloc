@@ -1037,6 +1037,10 @@ def rule_dist003_gradient_accumulation(
     if batch_size is None or batch_size >= 32:
         return []  # Reasonable batch size, underutilization likely elsewhere
 
+    # Don't suggest adding accum if it's already active (contradicts THRU003)
+    if findings.gradient_accumulation_steps and findings.gradient_accumulation_steps >= 2:
+        return []
+
     return [Diagnosis(
         rule_id="DIST003",
         severity="info",
