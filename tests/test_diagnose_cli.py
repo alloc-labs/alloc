@@ -976,7 +976,7 @@ def test_ghost_help_shows_explain_flag():
     """Ghost --help should show --explain option."""
     result = runner.invoke(app, ["ghost", "--help"])
     assert result.exit_code == 0
-    assert "--explain" in result.output
+    assert "--explain" in _plain(result.output)
 
 
 def test_ghost_explain_json_output():
@@ -1056,7 +1056,7 @@ def test_diagnose_help_shows_migrate_flag():
     """Diagnose --help should show --migrate option."""
     result = runner.invoke(app, ["diagnose", "--help"])
     assert result.exit_code == 0
-    assert "--migrate" in result.output
+    assert "--migrate" in _plain(result.output)
 
 
 def test_migrate_fetch_callable():
@@ -1131,7 +1131,7 @@ def test_diagnose_help_shows_upgrades_flag():
     """Diagnose --help should show --upgrades option."""
     result = runner.invoke(app, ["diagnose", "--help"])
     assert result.exit_code == 0
-    assert "--upgrades" in result.output
+    assert "--upgrades" in _plain(result.output)
 
 
 # ---------------------------------------------------------------------------
@@ -1238,7 +1238,7 @@ def test_diagnose_help_shows_explore_flag():
     """Diagnose --help should show --explore option."""
     result = runner.invoke(app, ["diagnose", "--help"])
     assert result.exit_code == 0
-    assert "--explore" in result.output
+    assert "--explore" in _plain(result.output)
 
 
 def test_fetch_explore_callable():
