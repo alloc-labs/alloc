@@ -271,3 +271,34 @@ def test_activation_method_field_set():
     # Fallback path
     r3 = ghost(param_count_b=1.0)
     assert r3.activation_method == "weights_fallback"
+
+
+# ---------------------------------------------------------------------------
+# Shared/tied parameter dedup tests
+# ---------------------------------------------------------------------------
+
+
+def test_count_from_model_dedup_shared_params():
+    """Shared parameters (same data_ptr) should be counted only once."""
+    pytest = __import__("pytest")
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
+    from alloc.ghost import _count_from_model
+
+    class TiedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(100, 64)
+            self.proj = nn.Linear(64, 100, bias=False)
+            # Tie weights: same tensor
+            self.proj.weight = self.embed.weight
+
+        def forward(self, x):
+            return self.proj(self.embed(x))
+
+    model = TiedModel()
+    count, dtype_str = _count_from_model(model)
+    # embed.weight = 100*64 = 6400 params (shared with proj.weight)
+    # proj has no bias
+    # Total should be 6400, NOT 12800
+    assert count == 6400

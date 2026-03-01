@@ -155,3 +155,24 @@ def test_hooks_cleaned_up_on_failure():
     # Hooks should be cleaned up
     hooks_after = sum(len(m._forward_hooks) for m in model.modules())
     assert hooks_after == hooks_before
+
+
+def test_count_params_dedup_shared():
+    """Shared parameters (same data_ptr) should be counted only once."""
+    from alloc.extractor_runner import _count_params
+
+    class TiedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(100, 64)
+            self.proj = nn.Linear(64, 100, bias=False)
+            # Tie weights: same tensor
+            self.proj.weight = self.embed.weight
+
+        def forward(self, x):
+            return self.proj(self.embed(x))
+
+    model = TiedModel()
+    count, dtype_str = _count_params(model)
+    # embed.weight = 100*64 = 6400 params (shared with proj.weight)
+    assert count == 6400

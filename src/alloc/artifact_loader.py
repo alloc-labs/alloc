@@ -134,7 +134,7 @@ def _parse_artifact(raw: dict) -> ArtifactData:
     # Per-GPU VRAM: use per_rank_peak_vram_mb if available, else single peak
     per_rank = probe.get("per_rank_peak_vram_mb")
     if isinstance(per_rank, list) and per_rank:
-        data.per_gpu_vram_used_mb = [float(v) for v in per_rank]
+        data.per_gpu_vram_used_mb = [x for x in (_float_or_none(v) for v in per_rank) if x is not None]
     elif peak is not None:
         data.per_gpu_vram_used_mb = [peak]
 
@@ -145,12 +145,12 @@ def _parse_artifact(raw: dict) -> ArtifactData:
     if samples:
         utils = [s.get("gpu_util_pct") for s in samples if s.get("gpu_util_pct") is not None]
         if utils:
-            data.gpu_utilization_pct = [float(u) for u in utils]
+            data.gpu_utilization_pct = [x for x in (_float_or_none(u) for u in utils) if x is not None]
             data.avg_gpu_util = sum(data.gpu_utilization_pct) / len(data.gpu_utilization_pct)
 
         powers = [s.get("power_w") for s in samples if s.get("power_w") is not None]
         if powers:
-            data.power_draw_w = [float(p) for p in powers]
+            data.power_draw_w = [x for x in (_float_or_none(p) for p in powers) if x is not None]
 
     # Avg GPU util from probe aggregate
     if data.avg_gpu_util is None:
@@ -187,7 +187,7 @@ def _parse_artifact(raw: dict) -> ArtifactData:
     # Raw step times (for per-rank merge / straggler detection)
     raw_times = probe.get("step_times_raw")
     if isinstance(raw_times, list) and raw_times:
-        data.step_times_ms = [float(t) for t in raw_times if t is not None]
+        data.step_times_ms = [x for x in (_float_or_none(t) for t in raw_times) if x is not None]
 
     # Run metadata
     data.exit_code = probe.get("exit_code")

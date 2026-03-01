@@ -250,12 +250,14 @@ def _count_from_model(model: Any) -> tuple:
     try:
         for name, param in model.named_parameters():
             ptr = param.data_ptr()
-            if ptr in seen_ptrs:
+            # data_ptr() returns 0 for meta-device tensors; skip dedup in that case
+            if ptr != 0 and ptr in seen_ptrs:
                 continue
-            seen_ptrs.add(ptr)
+            if ptr != 0:
+                seen_ptrs.add(ptr)
             total += param.numel()
             # Use dtype of the first parameter
-            if len(seen_ptrs) == 1:
+            if total == param.numel():
                 dtype_str = str(param.dtype).replace("torch.", "")
     except Exception:
         pass
