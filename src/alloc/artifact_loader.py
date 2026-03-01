@@ -181,10 +181,8 @@ def _parse_artifact(raw: dict) -> ArtifactData:
     gc = probe.get("gradient_checkpointing")
     data.gradient_checkpointing = bool(gc) if gc is not None else None
     data.attention_type = probe.get("attention_type")
-    pc = probe.get("param_count")
-    data.param_count = int(pc) if pc is not None else None
-    tpc = probe.get("trainable_param_count")
-    data.trainable_param_count = int(tpc) if tpc is not None else None
+    data.param_count = _int_or_none(probe.get("param_count"))
+    data.trainable_param_count = _int_or_none(probe.get("trainable_param_count"))
 
     # Raw step times (for per-rank merge / straggler detection)
     raw_times = probe.get("step_times_raw")
@@ -228,6 +226,16 @@ def _float_or_none(val) -> Optional[float]:
         return None
     try:
         return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _int_or_none(val) -> Optional[int]:
+    """Convert a value to int, returning None on failure."""
+    if val is None:
+        return None
+    try:
+        return int(val)
     except (ValueError, TypeError):
         return None
 

@@ -32,13 +32,21 @@ def _patch_sys_exit():
 
 
 def _count_params(model):
-    """Count parameters in an nn.Module."""
+    """Count parameters in an nn.Module.
+
+    Uses data_ptr() to deduplicate shared/tied parameters.
+    """
+    seen_ptrs = set()
     total = 0
     dtype_str = "float32"
     try:
-        for i, (name, param) in enumerate(model.named_parameters()):
+        for name, param in model.named_parameters():
+            ptr = param.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
             total += param.numel()
-            if i == 0:
+            if len(seen_ptrs) == 1:
                 dtype_str = str(param.dtype).replace("torch.", "")
     except Exception:
         pass

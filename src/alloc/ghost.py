@@ -240,14 +240,22 @@ def _ghost_impl(
 
 
 def _count_from_model(model: Any) -> tuple:
-    """Extract param count and dtype from a torch model. Returns (count, dtype_str)."""
+    """Extract param count and dtype from a torch model. Returns (count, dtype_str).
+
+    Uses data_ptr() to deduplicate shared/tied parameters.
+    """
+    seen_ptrs = set()
     total = 0
     dtype_str = "float16"
     try:
         for name, param in model.named_parameters():
+            ptr = param.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
             total += param.numel()
             # Use dtype of the first parameter
-            if total == param.numel():
+            if len(seen_ptrs) == 1:
                 dtype_str = str(param.dtype).replace("torch.", "")
     except Exception:
         pass
