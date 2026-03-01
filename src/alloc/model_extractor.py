@@ -31,6 +31,8 @@ class ModelInfo:
     hidden_dim: Optional[int] = None
     num_layers: Optional[int] = None
     seq_length: Optional[int] = None
+    activation_memory_bytes: Optional[int] = None
+    activation_method: Optional[str] = None  # "traced" | None
 
 
 def extract_model_info(
@@ -121,6 +123,8 @@ def _extract_via_subprocess(
                 hidden_dim=data.get("hidden_dim"),
                 num_layers=data.get("num_layers"),
                 seq_length=data.get("seq_length"),
+                activation_memory_bytes=data.get("activation_memory_bytes"),
+                activation_method=data.get("activation_method"),
             )
 
         return None

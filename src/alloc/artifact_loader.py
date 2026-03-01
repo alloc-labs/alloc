@@ -232,21 +232,6 @@ def _float_or_none(val) -> Optional[float]:
         return None
 
 
-def _percentile(values: List[float], pct: float) -> float:
-    """Compute a percentile from an unsorted list."""
-    if not values:
-        return 0.0
-    import math
-    sorted_vals = sorted(values)
-    n = len(sorted_vals)
-    k = (pct / 100.0) * (n - 1)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_vals[int(k)]
-    return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
-
-
 def find_rank_artifacts(directory: str = ".") -> List[str]:
     """Find all alloc_artifact_rank*.json.gz files in directory."""
     pattern = os.path.join(directory, "alloc_artifact_rank*.json.gz")

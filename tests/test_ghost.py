@@ -221,3 +221,53 @@ def test_partial_transformer_fields():
     assert report.num_layers is None
     # Activations should be ≈ weights
     assert 10 < report.activations_gb < 16
+
+
+# ---------------------------------------------------------------------------
+# Forward hook activation tracing tests
+# ---------------------------------------------------------------------------
+
+
+def test_traced_activations_used_when_available():
+    """activation_memory_bytes overrides formula and fallback."""
+    # 1GB traced activations at batch_size=1
+    traced_bytes = 1024 * 1024 * 1024
+    report = ghost(param_count_b=7.0, dtype="fp16", activation_memory_bytes=traced_bytes)
+    # Should use traced value (1GB at batch_size=1, no batch scaling since batch_size=None→scale=1)
+    assert 0.9 < report.activations_gb < 1.1
+    assert report.activation_method == "traced"
+
+
+def test_traced_activations_scale_with_batch():
+    """batch_size=8 → 8x traced value."""
+    traced_bytes = 1024 * 1024 * 1024  # 1GB at batch_size=1
+    report = ghost(param_count_b=7.0, dtype="fp16", batch_size=8, activation_memory_bytes=traced_bytes)
+    # Should be 8 * 1GB = 8GB
+    assert 7.5 < report.activations_gb < 8.5
+    assert report.activation_method == "traced"
+
+
+def test_traced_none_falls_to_formula():
+    """None → existing transformer path when hidden_dim/seq_length/batch_size given."""
+    report = ghost(
+        param_count_b=7.0, dtype="fp16",
+        batch_size=32, seq_length=2048, hidden_dim=4096,
+        activation_memory_bytes=None,
+    )
+    assert report.activation_method == "transformer_formula"
+    assert report.num_layers is not None
+
+
+def test_activation_method_field_set():
+    """GhostReport.activation_method populated for all paths."""
+    # Traced path
+    r1 = ghost(param_count_b=1.0, activation_memory_bytes=1000)
+    assert r1.activation_method == "traced"
+
+    # Formula path
+    r2 = ghost(param_count_b=1.0, batch_size=8, seq_length=512, hidden_dim=768)
+    assert r2.activation_method == "transformer_formula"
+
+    # Fallback path
+    r3 = ghost(param_count_b=1.0)
+    assert r3.activation_method == "weights_fallback"

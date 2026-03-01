@@ -81,6 +81,7 @@ def ghost(
         batch_size=batch_size,
         seq_length=resolved_seq_length,
         hidden_dim=resolved_hidden_dim,
+        activation_memory_bytes=info.activation_memory_bytes,
     )
     report.extraction_method = info.method
 

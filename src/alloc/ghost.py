@@ -75,6 +75,7 @@ class GhostReport:
     buffer_gb: float
     total_gb: float
     extraction_method: Optional[str] = None  # "execution", "ast", "manual"
+    activation_method: Optional[str] = None  # "traced", "transformer_formula", "weights_fallback"
     batch_size: Optional[int] = None
     seq_length: Optional[int] = None
     hidden_dim: Optional[int] = None
@@ -94,6 +95,7 @@ def ghost(
     seq_length: Optional[int] = None,
     hidden_dim: Optional[int] = None,
     optimizer_type: Optional[str] = None,
+    activation_memory_bytes: Optional[int] = None,
 ) -> GhostReport:
     """Run a Ghost Scan on a model or param count.
 
@@ -107,6 +109,9 @@ def ghost(
         # With optimizer awareness
         report = alloc.ghost(param_count_b=7.0, optimizer_type="SGD")
 
+        # With traced activations from forward hooks
+        report = alloc.ghost(param_count_b=7.0, activation_memory_bytes=12345678)
+
     Never raises. If something goes wrong, returns a best-effort report.
     """
     try:
@@ -119,6 +124,7 @@ def ghost(
             seq_length=seq_length,
             hidden_dim=hidden_dim,
             optimizer_type=optimizer_type,
+            activation_memory_bytes=activation_memory_bytes,
         )
     except Exception:
         # Never crash user code
@@ -145,6 +151,7 @@ def _ghost_impl(
     seq_length: Optional[int],
     hidden_dim: Optional[int],
     optimizer_type: Optional[str] = None,
+    activation_memory_bytes: Optional[int] = None,
 ) -> GhostReport:
     """Core Ghost implementation."""
     resolved_count = 0
@@ -184,20 +191,28 @@ def _ghost_impl(
     gradients_bytes = resolved_count * grad_bytes_per_param
     optimizer_bytes = resolved_count * optimizer_bpp
 
-    # Activation estimation: two paths
+    # Activation estimation: three paths
     est_layers = None
-    if hidden_dim is not None and seq_length is not None and batch_size is not None:
-        # Transformer path: use architecture-specific formula
+    act_method = None
+    if activation_memory_bytes is not None and activation_memory_bytes > 0:
+        # Path 1: Traced activations from forward hooks — scale linearly by batch_size
+        scale = batch_size if batch_size and batch_size > 0 else 1
+        activations_bytes = activation_memory_bytes * scale
+        act_method = "traced"
+    elif hidden_dim is not None and seq_length is not None and batch_size is not None:
+        # Path 2: Transformer formula — use architecture-specific formula
         est_layers = 1
         if resolved_count > 0 and hidden_dim > 0:
             est_layers = max(1, round(resolved_count / (_TRANSFORMER_PARAM_FACTOR * hidden_dim * hidden_dim)))
         # Per-layer activation: B * S * H * bytes_per_param
         activations_bytes = est_layers * batch_size * seq_length * hidden_dim * bytes_per_param
+        act_method = "transformer_formula"
     else:
-        # Architecture-agnostic path: activations ≈ 1x model weights
+        # Path 3: Fallback — activations ≈ 1x model weights
         # Empirically reasonable across CNNs, ViTs, diffusion models for moderate batch sizes.
         # Underestimates for large batches, overestimates for small — but never wildly wrong.
         activations_bytes = weights_bytes
+        act_method = "weights_fallback"
 
     weights_gb = weights_bytes * to_gb
     gradients_gb = gradients_bytes * to_gb
@@ -216,6 +231,7 @@ def _ghost_impl(
         activations_gb=round(activations_gb, 2),
         buffer_gb=round(buffer_gb, 2),
         total_gb=round(total_gb, 2),
+        activation_method=act_method,
         batch_size=batch_size,
         seq_length=seq_length,
         hidden_dim=hidden_dim,

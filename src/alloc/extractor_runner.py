@@ -62,7 +62,98 @@ def _extract_architecture(model):
             or getattr(config, "max_seq_len", None)
         )
         info["model_type"] = getattr(config, "model_type", None)
+        info["vocab_size"] = getattr(config, "vocab_size", None)
+        info["image_size"] = getattr(config, "image_size", None)
+        info["num_channels"] = getattr(config, "num_channels", None)
     return info
+
+
+def _build_dummy_input(model, arch_info):
+    """Build a dummy input tensor for a forward pass. Returns Tensor or None.
+
+    Three inference paths:
+      1. HF transformer config: vocab_size → token IDs
+      2. Vision config: image_size → image tensor
+      3. Weight shape inference: first param shape → infer input
+    """
+    import torch
+
+    # Path 1: HF transformer with vocab_size → token IDs
+    vocab_size = arch_info.get("vocab_size")
+    if vocab_size is not None and isinstance(vocab_size, int) and vocab_size > 0:
+        seq_len = arch_info.get("seq_length") or 128
+        seq_len = min(seq_len, 128)
+        return torch.zeros(1, seq_len, dtype=torch.long)
+
+    # Path 2: Vision config with image_size
+    image_size = arch_info.get("image_size")
+    if image_size is not None and isinstance(image_size, int) and image_size > 0:
+        num_channels = arch_info.get("num_channels") or 3
+        return torch.zeros(1, num_channels, image_size, image_size)
+
+    # Path 3: Infer from first parameter shape
+    try:
+        for name, param in model.named_parameters():
+            if param.dim() == 4:
+                # Conv2d weight: (out_ch, in_ch, kH, kW) → image input
+                in_ch = param.shape[1]
+                return torch.zeros(1, in_ch, 32, 32)
+            if param.dim() == 2:
+                # Linear weight: (out_features, in_features) → vector input
+                in_features = param.shape[1]
+                return torch.zeros(1, in_features)
+    except Exception:
+        pass
+
+    return None
+
+
+def _measure_activations(model, arch_info):
+    """Measure activation memory via forward hooks on CPU. batch_size=1.
+
+    Returns {"activation_memory_bytes": int, "activation_method": "traced"} or {} on failure.
+    """
+    import torch
+
+    hooks = []
+    activation_sizes = []
+
+    def _hook_fn(module, input, output):
+        if isinstance(output, torch.Tensor):
+            activation_sizes.append(output.numel() * output.element_size())
+        elif isinstance(output, (tuple, list)):
+            for t in output:
+                if isinstance(t, torch.Tensor):
+                    activation_sizes.append(t.numel() * t.element_size())
+
+    try:
+        # Register hooks on every leaf module
+        for module in model.modules():
+            children = list(module.children())
+            if not children:  # leaf module
+                hooks.append(module.register_forward_hook(_hook_fn))
+
+        dummy_input = _build_dummy_input(model, arch_info)
+        if dummy_input is None:
+            return {}
+
+        with torch.no_grad():
+            model.eval()
+            model(dummy_input)
+
+        if not activation_sizes:
+            return {}
+
+        total_bytes = sum(activation_sizes)
+        return {
+            "activation_memory_bytes": total_bytes,
+            "activation_method": "traced",
+        }
+    except Exception:
+        return {}
+    finally:
+        for h in hooks:
+            h.remove()
 
 
 def main():
@@ -158,6 +249,9 @@ def main():
 
         arch_info = _extract_architecture(best_model_obj) if best_model_obj else {}
 
+        # Measure activation memory via forward hooks
+        activation_result = _measure_activations(best_model_obj, arch_info) if best_model_obj else {}
+
         result = {
             "status": "ok",
             "param_count": best[0],
@@ -167,6 +261,8 @@ def main():
             "num_layers": arch_info.get("num_layers"),
             "seq_length": arch_info.get("seq_length"),
             "model_type": arch_info.get("model_type"),
+            "activation_memory_bytes": activation_result.get("activation_memory_bytes"),
+            "activation_method": activation_result.get("activation_method"),
         }
     else:
         result = {"status": "no_model"}
