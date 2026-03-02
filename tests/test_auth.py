@@ -182,22 +182,29 @@ def test_pkce_pair_unique():
 
 
 def test_find_open_port_returns_int():
-    port = _find_open_port()
+    # Use a dynamic base to avoid conflicts with other processes.
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        base = s.getsockname()[1]
+    # base is now free — _find_open_port starting there should succeed.
+    port = _find_open_port(start=base)
     assert isinstance(port, int)
-    assert port >= 17256
+    assert port >= base
 
 
 def test_find_open_port_skips_busy(tmp_path: Path):
     """If a port is in use, the finder should skip it."""
     import socket
 
-    # Bind the first port in the range.
+    # Bind an ephemeral port and use it as the start of the range.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 17256))
+    s.bind(("127.0.0.1", 0))
+    busy_port = s.getsockname()[1]
     try:
-        port = _find_open_port(start=17256)
-        # Should return a port > 17256 since 17256 is busy.
-        assert port > 17256
+        port = _find_open_port(start=busy_port)
+        # Should return a port > busy_port since busy_port is in use.
+        assert port > busy_port
     finally:
         s.close()
 
