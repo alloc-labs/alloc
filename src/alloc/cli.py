@@ -3442,7 +3442,7 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
         interconnect = config_interconnect
     if not interconnect:
         interconnect = "unknown"
-    if interconnect not in ("pcie", "nvlink", "infiniband", "unknown"):
+    if interconnect not in ("pcie", "nvlink", "nvlink_switch", "nvlink_p2p", "infiniband", "unknown"):
         interconnect = "unknown"
 
     return {

@@ -139,9 +139,11 @@ def _detect_interconnect(handles, pynvml):
     # type: (list, ...) -> Optional[str]
     """Detect GPU interconnect type using NVML topology API.
 
-    Checks topology between GPU pairs. Returns "nvlink" if any pair
-    is connected via NVLink, "pcie" if all pairs use PCIe, or None
-    if detection fails or only one GPU.
+    Returns "nvlink_switch", "nvlink_p2p", "nvlink" (fallback), "pcie",
+    or None if detection fails or only one GPU.
+
+    Heuristic matches callbacks.py: ≥6 active NVLink connections AND
+    ≥4 GPUs → nvlink_switch (DGX/HGX), else nvlink_p2p.
     """
     if len(handles) < 2:
         return None
@@ -153,7 +155,25 @@ def _detect_interconnect(handles, pynvml):
         # pynvml may return an int or an enum; normalize to int
         level_val = int(level) if not isinstance(level, int) else level
         if level_val <= 20:
-            return "nvlink"
+            # NVLink detected — try to differentiate switch vs point-to-point
+            try:
+                active_links = 0
+                for link in range(18):  # max NVLink connections
+                    try:
+                        state = pynvml.nvmlDeviceGetNvLinkState(handles[0], link)
+                        if state:
+                            active_links += 1
+                    except Exception:
+                        break
+                # [HEURISTIC] Threshold: 6 links. DGX A100 has 12, DGX H100 has 18.
+                # Point-to-point 2-GPU: 2 links. 4-GPU ring: 2-4 links.
+                num_gpus = len(handles)
+                if active_links >= 6 and num_gpus >= 4:
+                    return "nvlink_switch"
+                return "nvlink_p2p"
+            except Exception:
+                # Link counting failed — fall back to generic nvlink
+                return "nvlink"
         return "pcie"
     except Exception:
         return None

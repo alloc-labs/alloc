@@ -27,6 +27,8 @@ _ALLOWED_OBJECTIVES = {
 _ALLOWED_INTERCONNECTS = {
     "pcie",
     "nvlink",
+    "nvlink_switch",
+    "nvlink_p2p",
     "infiniband",
     "unknown",
 }

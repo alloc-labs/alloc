@@ -1388,7 +1388,7 @@ def rule_reg001_step_time_regression(
         rationale=f"Step time p50 increased {pct_change:.0f}% ({prev_p50:.1f} ms → {cur_p50:.1f} ms) between runs.",
         estimated_impact=f"Training is ~{pct_change:.0f}% slower than previous run",
         confidence="high",
-        doc_url=None,
+        doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
         evidence={"prev_step_time_p50_ms": str(round(prev_p50, 1)), "cur_step_time_p50_ms": str(round(cur_p50, 1)), "pct_change": str(round(pct_change))},
     )]
 
@@ -1431,7 +1431,7 @@ def rule_reg002_throughput_regression(
         rationale=f"Throughput decreased {drop:.0f}% ({prev:.1f} → {cur:.1f} samples/sec) between runs.",
         estimated_impact=f"Training is ~{drop:.0f}% slower than previous run",
         confidence="high",
-        doc_url=None,
+        doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
         evidence={"prev_throughput_sps": str(round(prev, 1)), "cur_throughput_sps": str(round(cur, 1)), "pct_drop": str(round(drop))},
     )]
 
@@ -1478,7 +1478,7 @@ def rule_reg003_vram_regression(
         rationale=f"Peak VRAM increased {pct_change:.0f}% ({prev:.0f} MB → {cur:.0f} MB) between runs.",
         estimated_impact="Increased OOM risk if trend continues",
         confidence="medium",
-        doc_url=None,
+        doc_url="https://pytorch.org/docs/stable/torch_cuda_memory.html",
         evidence={"prev_peak_vram_mb": str(round(prev)), "cur_peak_vram_mb": str(round(cur)), "pct_change": str(round(pct_change))},
     )]
 
@@ -1521,7 +1521,7 @@ def rule_reg004_util_regression(
         rationale=f"GPU utilization dropped {drop:.0f} percentage points ({prev:.0f}% → {cur:.0f}%) between runs.",
         estimated_impact=f"GPU is {drop:.0f}% less utilized than previous run",
         confidence="medium",
-        doc_url=None,
+        doc_url="https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html",
         evidence={"prev_gpu_util_pct": str(round(prev)), "cur_gpu_util_pct": str(round(cur)), "drop_pp": str(round(drop))},
     )]
 
