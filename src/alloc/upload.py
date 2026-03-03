@@ -153,6 +153,8 @@ def upload_artifact(artifact_path: str, api_url: str, token: str) -> dict:
         "trainable_param_count": probe.get("trainable_param_count"),
         # Outcome tracking: link to previous run
         "baseline_run_id": probe.get("baseline_run_id"),
+        # Experiment grouping
+        "experiment_id": probe.get("experiment_id"),
     }
 
     with httpx.Client(timeout=30) as client:

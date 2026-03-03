@@ -305,6 +305,7 @@ def run(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show hardware context, sample dump, recommendation reasoning"),
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
     after: Optional[str] = typer.Option(None, "--after", help="Previous run ID to compare against (outcome tracking)"),
+    experiment: Optional[str] = typer.Option(None, "--experiment", "-e", help="Experiment group name"),
 ):
     """Run a training command with GPU monitoring."""
     from alloc.probe import probe_command
@@ -407,6 +408,7 @@ def run(
             "max_budget_hourly": max_budget_hourly,
             "command": " ".join(command),
             "baseline_run_id": after,
+            "experiment_id": experiment,
         }
         # Merge timing fields from callback sidecar
         if callback_data:
