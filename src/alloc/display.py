@@ -33,7 +33,15 @@ def print_ghost_report(report: GhostReport) -> None:
         header = f"Ghost Scan — {report.param_count_b:.1f}B params ({report.dtype})"
         confidence_label = _ghost_confidence_label(getattr(report, "extraction_method", None))
         console.print()
-        console.print(Panel(table, title=header, border_style="green", padding=(1, 2)))
+        if getattr(report, "estimation_failed", False):
+            console.print(Panel(
+                "[bold yellow]Estimation failed.[/bold yellow] Could not extract model parameters.\n"
+                "Check that the model class is importable and the script runs correctly.\n"
+                "Values below are [bold]not reliable[/bold].",
+                title=header, border_style="yellow", padding=(1, 2),
+            ))
+        else:
+            console.print(Panel(table, title=header, border_style="green", padding=(1, 2)))
         console.print(f"  [dim]Confidence: {confidence_label}[/dim]")
         console.print()
     except ImportError:
@@ -104,8 +112,11 @@ def print_verdict(result, artifact_path="", step_count=None, callback_data=None,
         if parts[-1].upper().endswith("GB"):
             gpu_short = "-".join(parts[:-1])
 
+    is_calibrate = result.stop_reason in ("stable", "timeout")
     if result.exit_code is None:
         proc_status = "unknown"
+    elif is_calibrate and result.exit_code in (-15, 143):
+        proc_status = "stopped by Alloc (calibrate mode)"
     elif result.exit_code == 0:
         proc_status = "success"
     else:
@@ -161,6 +172,9 @@ def print_verdict(result, artifact_path="", step_count=None, callback_data=None,
         console.print()
         console.print(Panel(content, title="Run Summary", border_style="blue", padding=(1, 0)))
 
+        if is_calibrate:
+            console.print(f"  [dim]Alloc auto-stopped after collecting enough GPU samples.[/dim]")
+            console.print(f"  [dim]Use --full to let training run to completion without Alloc stopping it.[/dim]")
         if artifact_path:
             console.print(f"  [dim]Artifact: {artifact_path}[/dim]")
         console.print(f"  [dim]Tip: Run `alloc diagnose <script.py>` for code-level suggestions[/dim]")
@@ -229,8 +243,11 @@ def build_verdict_dict(result, artifact_path="", step_count=None, callback_data=
     vram_util_pct = result.vram_utilization_pct
     duration_label = _stop_reason_label(result.stop_reason, result.calibration_duration_s)
 
+    is_calibrate = result.stop_reason in ("stable", "timeout")
     if result.exit_code is None:
         proc_status = "unknown"
+    elif is_calibrate and result.exit_code in (-15, 143):
+        proc_status = "stopped by Alloc (calibrate mode)"
     elif result.exit_code == 0:
         proc_status = "success"
     else:

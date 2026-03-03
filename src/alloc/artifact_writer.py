@@ -44,6 +44,10 @@ def write_report(
             "context": context if context else None,
         }
 
+        if os.path.exists(resolved_path):
+            import sys
+            print(f"alloc: warning: overwriting existing artifact at {resolved_path}", file=sys.stderr)
+
         with gzip.open(resolved_path, "wt", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 

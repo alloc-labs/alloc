@@ -80,6 +80,7 @@ class GhostReport:
     seq_length: Optional[int] = None
     hidden_dim: Optional[int] = None
     num_layers: Optional[int] = None
+    estimation_failed: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -139,6 +140,7 @@ def ghost(
             activations_gb=0.0,
             buffer_gb=0.0,
             total_gb=0.0,
+            estimation_failed=True,
         )
 
 

@@ -86,10 +86,16 @@ def upload_artifact(artifact_path: str, api_url: str, token: str) -> dict:
         or _normalize_gpu_type(probe.get("gpu_name"))
         or _normalize_gpu_type(hardware.get("gpu_name"))
     )
-    num_gpus = _to_positive_int(
-        probe.get("num_gpus") or hardware.get("num_gpus_detected"),
-        default=1,
-    )
+    if not gpu_type:
+        import sys
+        raw_name = probe.get("gpu_name") or hardware.get("gpu_name") or "none detected"
+        print(f"alloc: warning: could not identify GPU type ({raw_name}). Cost and VRAM estimates may be inaccurate.", file=sys.stderr)
+
+    raw_num_gpus = probe.get("num_gpus") or hardware.get("num_gpus_detected")
+    num_gpus = _to_positive_int(raw_num_gpus, default=1)
+    if raw_num_gpus is None:
+        import sys
+        print("alloc: warning: could not detect GPU count, defaulting to 1. Multi-GPU estimates may be wrong.", file=sys.stderr)
 
     payload = {
         "model_name": probe.get("model_name"),

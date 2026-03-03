@@ -449,8 +449,13 @@ def run(
             if verbose:
                 from alloc.display import print_verbose_run
                 print_verbose_run(result, step_count=step_count)
-        elif artifact_path:
-            console.print(f"[dim]Artifact saved: {artifact_path}[/dim]")
+        else:
+            console.print("[yellow]No GPU data collected.[/yellow] Alloc could not read GPU metrics for this run.")
+            if result.error:
+                console.print(f"[dim]Reason: {result.error}[/dim]")
+            console.print("[dim]Check that an NVIDIA GPU is available and pynvml can access it.[/dim]")
+            if artifact_path:
+                console.print(f"[dim]Artifact saved: {artifact_path}[/dim]")
 
     # Upload when explicitly opted in: --upload flag or ALLOC_UPLOAD env var
     # Being logged in alone does NOT trigger upload (privacy-first)

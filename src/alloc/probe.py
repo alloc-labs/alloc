@@ -374,7 +374,7 @@ def probe_command(
 
         # Gracefully terminate the process if still running (calibrate mode only)
         if proc.poll() is None:
-            print("\nalloc: Calibration complete — stopping training process (SIGTERM).", file=sys.stderr, flush=True)
+            print("\nalloc: Calibration complete — Alloc collected enough data and is shutting down your training process.", file=sys.stderr, flush=True)
             proc.send_signal(signal.SIGTERM)
             try:
                 proc.wait(timeout=15)
