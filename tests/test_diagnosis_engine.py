@@ -1,13 +1,15 @@
 """Tests for diagnosis_engine.py — rule evaluation and result assembly."""
 
+import sys
 import textwrap
+from types import SimpleNamespace
 
 from alloc.artifact_loader import ArtifactData
 from alloc.code_analyzer import analyze_script
 from alloc.diagnosis_engine import (
     run_diagnosis, DiagnoseResult, _deduplicate,
     _determine_tier, _build_comparison, _build_efficiency,
-    _sniff_environment, _estimate_model_params,
+    _sniff_environment, _estimate_model_params, _quick_hw_context,
 )
 from alloc.diagnosis_rules import Diagnosis
 
@@ -278,6 +280,49 @@ def test_sniff_environment_alloc_conf(monkeypatch):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     ctx = _sniff_environment()
     assert ctx["pytorch_cuda_alloc_conf"] == "expandable_segments:True"
+
+
+def test_quick_hw_context_respects_cuda_visible_devices(monkeypatch):
+    """Visible GPU count should not be overwritten by physical NVML count."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    fake_mem = SimpleNamespace(total=80 * 1024 * 1024 * 1024)
+    fake_nvml = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: 8,
+        nvmlDeviceGetHandleByIndex=lambda _: object(),
+        nvmlDeviceGetName=lambda _: b"NVIDIA A100",
+        nvmlDeviceGetMemoryInfo=lambda _: fake_mem,
+        nvmlDeviceGetCudaComputeCapability=lambda _: (8, 0),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    ctx = _quick_hw_context()
+    assert ctx is not None
+    assert ctx["gpu_count"] == 1
+    assert ctx["gpu_count_physical"] == 8
+
+
+def test_quick_hw_context_uses_physical_count_when_no_cvd(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    fake_mem = SimpleNamespace(total=24 * 1024 * 1024 * 1024)
+    fake_nvml = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: 2,
+        nvmlDeviceGetHandleByIndex=lambda _: object(),
+        nvmlDeviceGetName=lambda _: b"NVIDIA L4",
+        nvmlDeviceGetMemoryInfo=lambda _: fake_mem,
+        nvmlDeviceGetCudaComputeCapability=lambda _: (8, 9),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    ctx = _quick_hw_context()
+    assert ctx is not None
+    assert ctx["gpu_count"] == 2
+    assert ctx["gpu_count_physical"] == 2
 
 
 # ---------------------------------------------------------------------------

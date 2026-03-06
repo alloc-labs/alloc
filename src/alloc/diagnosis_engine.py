@@ -462,6 +462,7 @@ def _quick_hw_context() -> Optional[Dict]:
     Returns None only if NVML fails AND no env vars are set.
     """
     ctx = _sniff_environment()
+    env_gpu_count = ctx.get("gpu_count")
 
     try:
         import pynvml
@@ -486,10 +487,14 @@ def _quick_hw_context() -> Optional[Dict]:
 
             ctx.update({
                 "gpu_name": name,
-                "gpu_count": device_count,
+                "gpu_count_physical": device_count,
                 "gpu_total_vram_mb": total_vram_mb,
                 "sm_version": sm_version,
             })
+            # Respect process-visible GPU selection (e.g., CUDA_VISIBLE_DEVICES=0).
+            # Keep physical count for debugging and richer explanations.
+            if env_gpu_count is None:
+                ctx["gpu_count"] = device_count
         finally:
             pynvml.nvmlShutdown()
     except Exception:
