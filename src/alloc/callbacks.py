@@ -370,15 +370,37 @@ class _NvmlMonitor:
 
         self._start_time = time.time()
 
-        # Discover all GPUs
+        # Discover GPUs — respect CUDA_VISIBLE_DEVICES when set
         try:
-            self._gpu_count = self._pynvml.nvmlDeviceGetCount()
+            physical_count = self._pynvml.nvmlDeviceGetCount()
         except Exception:
-            self._gpu_count = 1
+            physical_count = 1
 
-        # Get handles for all GPUs
+        # CUDA_VISIBLE_DEVICES limits which GPUs the process can use.
+        # NVML always returns the physical count, so we must filter manually.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if cvd:
+            visible_indices = []
+            for d in cvd.split(","):
+                d = d.strip()
+                if d:
+                    try:
+                        idx = int(d)
+                        if 0 <= idx < physical_count:
+                            visible_indices.append(idx)
+                    except ValueError:
+                        # UUID-style device identifiers — fall back to physical count
+                        visible_indices = list(range(physical_count))
+                        break
+            gpu_indices = visible_indices if visible_indices else list(range(physical_count))
+        else:
+            gpu_indices = list(range(physical_count))
+
+        self._gpu_count = len(gpu_indices)
+
+        # Get handles for visible GPUs
         self._gpu_handles = []
-        for i in range(self._gpu_count):
+        for i in gpu_indices:
             try:
                 handle = self._pynvml.nvmlDeviceGetHandleByIndex(i)
                 self._gpu_handles.append(handle)

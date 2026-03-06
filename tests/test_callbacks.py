@@ -358,6 +358,102 @@ class TestNvmlMonitorWithMock:
         assert "power_w" in sample
 
 
+class TestNvmlMonitorCudaVisibleDevices:
+    """Regression: NVML physical count must not override CUDA_VISIBLE_DEVICES."""
+
+    def _make_mock_pynvml(self, physical_count=8):
+        mock_pynvml = MagicMock()
+        mock_pynvml.nvmlInit.return_value = None
+        mock_pynvml.nvmlShutdown.return_value = None
+        mock_pynvml.nvmlDeviceGetCount.return_value = physical_count
+        mock_pynvml.nvmlDeviceGetName.return_value = "NVIDIA A100-SXM4-80GB"
+        mem = SimpleNamespace(total=80 * 1024**3, used=40 * 1024**3)
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem
+        mock_pynvml.nvmlSystemGetDriverVersion.return_value = "535.129.03"
+        mock_pynvml.nvmlSystemGetCudaDriverVersion.return_value = 12020
+        mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (8, 0)
+        util = SimpleNamespace(gpu=75.0, memory=60.0)
+        mock_pynvml.nvmlDeviceGetUtilizationRates.return_value = util
+        mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 300000
+        return mock_pynvml
+
+    def test_cvd_single_gpu_on_multi_host(self):
+        """CUDA_VISIBLE_DEVICES=0 on 8-GPU host → num_gpus_detected=1."""
+        mock_pynvml = self._make_mock_pynvml(physical_count=8)
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}):
+            with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+                monitor = _NvmlMonitor()
+            monitor.start()
+            import time
+            time.sleep(0.05)
+            monitor.stop()
+
+        hw, _ = monitor.get_results()
+        assert hw["num_gpus_detected"] == 1, (
+            f"Expected 1 (from CVD=0), got {hw['num_gpus_detected']}"
+        )
+
+    def test_cvd_two_gpus_on_multi_host(self):
+        """CUDA_VISIBLE_DEVICES=0,2 on 8-GPU host → num_gpus_detected=2."""
+        mock_pynvml = self._make_mock_pynvml(physical_count=8)
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,2"}):
+            with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+                monitor = _NvmlMonitor()
+            monitor.start()
+            import time
+            time.sleep(0.05)
+            monitor.stop()
+
+        hw, _ = monitor.get_results()
+        assert hw["num_gpus_detected"] == 2
+
+    def test_no_cvd_uses_physical_count(self):
+        """Without CVD set, num_gpus_detected = physical count."""
+        mock_pynvml = self._make_mock_pynvml(physical_count=4)
+        with patch.dict(os.environ, {}, clear=False):
+            # Ensure CUDA_VISIBLE_DEVICES is not set
+            env_copy = os.environ.copy()
+            env_copy.pop("CUDA_VISIBLE_DEVICES", None)
+            with patch.dict(os.environ, env_copy, clear=True):
+                with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+                    monitor = _NvmlMonitor()
+                monitor.start()
+                import time
+                time.sleep(0.05)
+                monitor.stop()
+
+        hw, _ = monitor.get_results()
+        assert hw["num_gpus_detected"] == 4
+
+    def test_cvd_out_of_range_ignored(self):
+        """CUDA_VISIBLE_DEVICES=0,99 on 4-GPU host → only valid index kept."""
+        mock_pynvml = self._make_mock_pynvml(physical_count=4)
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,99"}):
+            with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+                monitor = _NvmlMonitor()
+            monitor.start()
+            import time
+            time.sleep(0.05)
+            monitor.stop()
+
+        hw, _ = monitor.get_results()
+        assert hw["num_gpus_detected"] == 1  # only GPU 0 is valid
+
+    def test_cvd_empty_string_uses_physical(self):
+        """CUDA_VISIBLE_DEVICES='' → treated as unset, uses physical count."""
+        mock_pynvml = self._make_mock_pynvml(physical_count=4)
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}):
+            with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+                monitor = _NvmlMonitor()
+            monitor.start()
+            import time
+            time.sleep(0.05)
+            monitor.stop()
+
+        hw, _ = monitor.get_results()
+        assert hw["num_gpus_detected"] == 4
+
+
 class TestNvmlMonitorCleanup:
     def test_stop_calls_nvml_shutdown(self):
         """nvmlShutdown is called on stop."""
