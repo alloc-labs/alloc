@@ -138,7 +138,8 @@ def _detect_architecture(model, optimizer=None, training_args=None):
                                 "mistral", "qwen2", "phi", "gemma", "falcon",
                                 "bert", "roberta", "t5", "bart", "mbart",
                                 "whisper", "wav2vec2", "vit", "deit", "beit",
-                                "swin", "clip", "dinov2"},
+                                "swin", "clip", "dinov2", "deepseek",
+                                "starcoder2", "cohere", "mamba"},
                 "moe": {"mixtral", "switch_transformers"},
                 "diffusion": {"unet_2d_condition"},
             }
@@ -389,9 +390,19 @@ class _NvmlMonitor:
                         if 0 <= idx < physical_count:
                             visible_indices.append(idx)
                     except ValueError:
-                        # UUID-style device identifiers — fall back to physical count
-                        visible_indices = list(range(physical_count))
-                        break
+                        # UUID-style device identifiers — try NVML UUID matching
+                        try:
+                            for phys_idx in range(physical_count):
+                                handle = self._pynvml.nvmlDeviceGetHandleByIndex(phys_idx)
+                                uuid = self._pynvml.nvmlDeviceGetUUID(handle)
+                                if isinstance(uuid, bytes):
+                                    uuid = uuid.decode("utf-8", errors="replace")
+                                if d in uuid:
+                                    visible_indices.append(phys_idx)
+                                    break
+                        except Exception:
+                            visible_indices = list(range(physical_count))
+                            break
             gpu_indices = visible_indices if visible_indices else list(range(physical_count))
         else:
             gpu_indices = list(range(physical_count))
@@ -687,8 +698,14 @@ def _write_full_artifact(monitor, sidecar_data, step_times_raw=None):
         if sidecar_data.get("is_distributed"):
             probe_dict["is_distributed"] = True
             rank = sidecar_data.get("rank", 0)
+            world_size = sidecar_data.get("world_size", 1)
             probe_dict["rank"] = rank
-            probe_dict["world_size"] = sidecar_data.get("world_size", 1)
+            probe_dict["world_size"] = world_size
+            # Set num_gpus_detected to world_size so the artifact reflects
+            # the full distributed topology, not just the local GPU count.
+            probe_dict["num_gpus_detected"] = max(
+                probe_dict.get("num_gpus_detected", 1), world_size
+            )
             if rank > 0:
                 output_path = "alloc_artifact_rank{}.json.gz".format(rank)
 

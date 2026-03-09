@@ -40,8 +40,9 @@ def save_config(data: dict) -> None:
         cfg_file = _config_file()
         cfg_file.write_text(json.dumps(data, indent=2) + "\n")
         os.chmod(cfg_file, 0o600)
-    except Exception:
-        pass
+    except Exception as e:
+        import sys
+        print(f"Warning: could not secure config file permissions: {e}", file=sys.stderr)
 
 
 def get_token() -> str:

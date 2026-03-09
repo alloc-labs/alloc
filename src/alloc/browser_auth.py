@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import secrets
 import socket
 import threading
@@ -69,7 +70,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self._respond(
                 400,
                 "<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
-                f"<h2>Login failed</h2><p>{error_desc}</p>"
+                f"<h2>Login failed</h2><p>{html.escape(error_desc)}</p>"
                 "</body></html>",
             )
         else:

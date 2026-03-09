@@ -8,6 +8,7 @@ Graceful no-op if pynvml is not installed or no GPU is available.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -112,16 +113,38 @@ def _discover_gpu_indices(proc_pid, pynvml, fallback_index=0):
     except Exception:
         return [fallback_index]
 
-    # Collect target PIDs: the main process + its children
+    # Respect CUDA_VISIBLE_DEVICES — only search visible GPUs
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd:
+        visible_physical = []
+        for d in cvd.split(","):
+            d = d.strip()
+            if d:
+                try:
+                    idx = int(d)
+                    if 0 <= idx < device_count:
+                        visible_physical.append(idx)
+                except ValueError:
+                    visible_physical = list(range(device_count))
+                    break
+        search_indices = visible_physical if visible_physical else list(range(device_count))
+    else:
+        search_indices = list(range(device_count))
+
+    # Collect target PIDs: the main process + descendants (3 levels deep).
+    # torchrun uses: torchrun → elastic_agent → worker processes,
+    # so we need at least 3 levels to find DDP worker GPUs.
     target_pids = {proc_pid}
     for child in _get_child_pids(proc_pid):
         target_pids.add(child)
-        # Also check grandchildren (common with torchrun/accelerate)
         for grandchild in _get_child_pids(child):
             target_pids.add(grandchild)
+            # Great-grandchildren: covers torchrun elastic launch wrapper
+            for ggchild in _get_child_pids(grandchild):
+                target_pids.add(ggchild)
 
     found_indices = []
-    for idx in range(device_count):
+    for idx in search_indices:
         try:
             handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
@@ -284,10 +307,27 @@ def probe_command(
 
             handles = [handle]
             discovery_done = False
+            discovery_attempts = 0
+            max_discovery_attempts = 3  # Retry at samples 5, 15, 30
+
+            # Determine expected GPU count from environment for retry logic
+            expected_gpus = 1
+            ws = os.environ.get("WORLD_SIZE", "").strip()
+            if ws:
+                try:
+                    expected_gpus = max(1, int(ws))
+                except ValueError:
+                    pass
 
             while not stop_event.is_set():
-                # After 5 samples, try to discover all GPUs used by the process
-                if not discovery_done and len(samples) >= 5 and proc.pid:
+                # Retry GPU discovery: at samples 5, 15, 30
+                # Keep retrying if we haven't found all expected GPUs yet
+                discovery_thresholds = [5, 15, 30]
+                if (not discovery_done
+                    and discovery_attempts < max_discovery_attempts
+                    and len(samples) >= discovery_thresholds[discovery_attempts]
+                    and proc.pid):
+                    discovery_attempts += 1
                     try:
                         discovered = _discover_gpu_indices(proc.pid, pynvml, fallback_index=gpu_index)
                         if len(discovered) > 1:
@@ -303,7 +343,9 @@ def probe_command(
                         pass
                     # Detect interconnect type between discovered GPUs
                     detected_ic_ref[0] = _detect_interconnect(handles, pynvml)
-                    discovery_done = True
+                    # Stop retrying if we found expected count or exhausted attempts
+                    if num_gpus_ref[0] >= expected_gpus or discovery_attempts >= max_discovery_attempts:
+                        discovery_done = True
 
                 # Sample from all monitored GPUs — aggregate: peak vram = max, util/power = mean
                 try:
@@ -413,6 +455,18 @@ def probe_command(
     cal_duration = None
     if calibration_time_ref[0] is not None:
         cal_duration = round(calibration_time_ref[0] - start_time, 2)
+
+    # Environment-based fallback: if NVML discovery found fewer GPUs than
+    # WORLD_SIZE indicates, trust the environment. The probe may miss GPUs
+    # due to DDP per-rank CVD isolation or timing races.
+    env_world = os.environ.get("WORLD_SIZE", "").strip()
+    if env_world:
+        try:
+            ws = int(env_world)
+            if ws > num_gpus_ref[0]:
+                num_gpus_ref[0] = ws
+        except ValueError:
+            pass
 
     if not samples:
         return ProbeResult(

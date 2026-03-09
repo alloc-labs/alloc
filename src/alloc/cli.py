@@ -370,6 +370,36 @@ def run(
     callback_data = _read_callback_data()
     step_count = callback_data.get("step_count") if callback_data else None
 
+    # Auto-merge per-rank callback artifacts for distributed runs.
+    # When DDP callbacks write alloc_artifact_rank{N}.json.gz alongside the
+    # main artifact, merge them to get per-rank peaks and straggler data.
+    try:
+        from alloc.artifact_loader import find_rank_artifacts, merge_artifacts, load_artifact
+        rank_files = find_rank_artifacts(".")
+        if rank_files:
+            # Include rank 0 artifact if it exists
+            main_artifact_path = os.path.join(".", "alloc_artifact.json.gz")
+            all_paths = ([main_artifact_path] if os.path.exists(main_artifact_path) else []) + rank_files
+            if len(all_paths) > 1:
+                merged = merge_artifacts(all_paths)
+                if merged is not None:
+                    # Enrich probe result with merged multi-GPU data
+                    result.num_gpus_detected = max(result.num_gpus_detected, merged.gpu_count or len(all_paths))
+                    if merged.per_rank_peak_vram_mb:
+                        result.per_gpu_peak_vram_mb = merged.per_rank_peak_vram_mb
+                    # Use merged step timing if probe didn't capture it
+                    if callback_data is None:
+                        callback_data = {}
+                    if merged.step_time_p50_ms and not callback_data.get("step_time_ms_p50"):
+                        callback_data["step_time_ms_p50"] = merged.step_time_p50_ms
+                    if merged.step_time_p90_ms and not callback_data.get("step_time_ms_p90"):
+                        callback_data["step_time_ms_p90"] = merged.step_time_p90_ms
+                    if merged.throughput_samples_per_sec and not callback_data.get("samples_per_sec"):
+                        callback_data["samples_per_sec"] = merged.throughput_samples_per_sec
+                    step_count = step_count or callback_data.get("step_count")
+    except Exception:
+        pass  # Never crash on merge failure
+
     # Discover environment context (git, container, Ray)
     from alloc.context import discover_context
     env_context = discover_context()

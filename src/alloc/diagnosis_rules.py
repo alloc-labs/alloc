@@ -289,7 +289,9 @@ def rule_dl005_main_thread(
     """
     results = []
     gpu_count = (hw or {}).get("gpu_count", 1) or 1
-    recommended = max(4, gpu_count * 2)
+    cpu_cores = os.cpu_count() or 4
+    per_gpu_cores = max(1, cpu_cores // max(gpu_count, 1))
+    recommended = max(4, min(gpu_count * 2, per_gpu_cores))
 
     for dl in findings.dataloaders:
         if dl.num_workers != 0:
@@ -428,7 +430,7 @@ def rule_mem005_no_torch_compile(
         return [Diagnosis(
             rule_id="MEM005",
             severity="info",
-            category="throughput",
+            category="memory",
             title="torch.compile not used",
             file_path=findings.script_path,
             line_number=0,
@@ -446,7 +448,7 @@ def rule_mem005_no_torch_compile(
     return [Diagnosis(
         rule_id="MEM005",
         severity="info",
-        category="throughput",
+        category="memory",
         title="torch.compile not used",
         file_path=findings.script_path,
         line_number=0,

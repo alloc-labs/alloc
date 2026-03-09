@@ -185,8 +185,8 @@ def _build_comparison(current: ArtifactData, previous: ArtifactData) -> Dict:
         })
 
     # Peak VRAM
-    cur_peak = max(current.per_gpu_vram_used_mb) if current.per_gpu_vram_used_mb else current.peak_vram_mb
-    prev_peak = max(previous.per_gpu_vram_used_mb) if previous.per_gpu_vram_used_mb else previous.peak_vram_mb
+    cur_peak = max(current.per_gpu_vram_used_mb) if current.per_gpu_vram_used_mb and len(current.per_gpu_vram_used_mb) > 0 else current.peak_vram_mb
+    prev_peak = max(previous.per_gpu_vram_used_mb) if previous.per_gpu_vram_used_mb and len(previous.per_gpu_vram_used_mb) > 0 else previous.peak_vram_mb
     _add("Peak VRAM", cur_peak, prev_peak, "MB", higher_is_worse=True)
 
     # Step time

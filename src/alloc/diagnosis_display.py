@@ -443,23 +443,46 @@ def print_diagnose_efficiency(result: DiagnoseResult) -> None:
     console.print(f"  Step time (p50): {p50:.1f} ms")
     console.print()
 
-    # Visual bar
-    compute_w = int(eff["compute_pct"] / 100 * 48)
-    data_w = int(eff["data_loading_pct"] / 100 * 48)
-    other_w = max(0, 48 - compute_w - data_w)
+    # Visual bar — layout depends on source (cuda_events vs wall_clock)
+    is_cuda = eff.get("source") == "cuda_events"
 
-    bar = (
-        "[green]" + "█" * compute_w + "[/green]"
-        + "[yellow]" + "█" * data_w + "[/yellow]"
-        + "[dim]" + "░" * other_w + "[/dim]"
-    )
-    console.print(f"  {bar}")
-    label = f"  [green]Compute: {eff['compute_pct']:.0f}%[/green]"
-    if eff["data_loading_pct"] > 0:
-        label += f"  [yellow]Data: {eff['data_loading_pct']:.0f}%[/yellow]"
-    if eff["other_pct"] > 0:
-        label += f"  [dim]Other: {eff['other_pct']:.0f}%[/dim]"
-    console.print(label)
+    if is_cuda:
+        fwd_w = int(eff["forward_pct"] / 100 * 48)
+        bwd_w = int(eff["backward_pct"] / 100 * 48)
+        opt_w = int(eff["optimizer_pct"] / 100 * 48)
+        dl_w = max(0, 48 - fwd_w - bwd_w - opt_w)
+
+        bar = (
+            "[green]" + "█" * fwd_w + "[/green]"
+            + "[cyan]" + "█" * bwd_w + "[/cyan]"
+            + "[magenta]" + "█" * opt_w + "[/magenta]"
+            + "[yellow]" + "█" * dl_w + "[/yellow]"
+        )
+        console.print(f"  {bar}")
+        label = f"  [green]Forward: {eff['forward_pct']:.0f}%[/green]"
+        label += f"  [cyan]Backward: {eff['backward_pct']:.0f}%[/cyan]"
+        if eff["optimizer_pct"] > 0:
+            label += f"  [magenta]Optimizer: {eff['optimizer_pct']:.0f}%[/magenta]"
+        if eff["data_loading_pct"] > 0:
+            label += f"  [yellow]Data: {eff['data_loading_pct']:.0f}%[/yellow]"
+        console.print(label)
+    else:
+        compute_w = int(eff["compute_pct"] / 100 * 48)
+        data_w = int(eff["data_loading_pct"] / 100 * 48)
+        other_w = max(0, 48 - compute_w - data_w)
+
+        bar = (
+            "[green]" + "█" * compute_w + "[/green]"
+            + "[yellow]" + "█" * data_w + "[/yellow]"
+            + "[dim]" + "░" * other_w + "[/dim]"
+        )
+        console.print(f"  {bar}")
+        label = f"  [green]Compute: {eff['compute_pct']:.0f}%[/green]"
+        if eff["data_loading_pct"] > 0:
+            label += f"  [yellow]Data: {eff['data_loading_pct']:.0f}%[/yellow]"
+        if eff["other_pct"] > 0:
+            label += f"  [dim]Other: {eff['other_pct']:.0f}%[/dim]"
+        console.print(label)
     console.print()
 
     # Component table
@@ -468,14 +491,28 @@ def print_diagnose_efficiency(result: DiagnoseResult) -> None:
     table.add_column("Time (est.)", justify="right", style="bold")
     table.add_column("Notes", style="dim")
 
-    table.add_row("GPU compute", f"{eff['compute_ms']:.1f} ms", f"{eff['compute_pct']:.0f}% of step")
-    if eff["data_loading_pct"] > 0:
-        dl_note = f"{eff['data_loading_pct']:.0f}%"
-        if eff["data_loading_pct"] > 20:
-            dl_note += " — bottleneck candidate"
-        table.add_row("Data loading", f"{eff['data_loading_ms']:.1f} ms", dl_note)
-    if eff["other_pct"] > 0:
-        table.add_row("Other/overhead", f"{eff['other_ms']:.1f} ms", f"{eff['other_pct']:.0f}%")
+    if is_cuda:
+        table.add_row("Forward", f"{eff['forward_ms']:.1f} ms", f"{eff['forward_pct']:.0f}% of step")
+        table.add_row("Backward", f"{eff['backward_ms']:.1f} ms", f"{eff['backward_pct']:.0f}% of step")
+        if eff["optimizer_pct"] > 0:
+            opt_note = f"{eff['optimizer_pct']:.0f}%"
+            if eff["optimizer_pct"] > 30:
+                opt_note += " — bottleneck candidate"
+            table.add_row("Optimizer", f"{eff['optimizer_ms']:.1f} ms", opt_note)
+        if eff["data_loading_pct"] > 0:
+            dl_note = f"{eff['data_loading_pct']:.0f}%"
+            if eff["data_loading_pct"] > 30:
+                dl_note += " — bottleneck candidate"
+            table.add_row("Data loading", f"{eff['data_loading_ms']:.1f} ms", dl_note)
+    else:
+        table.add_row("GPU compute", f"{eff['compute_ms']:.1f} ms", f"{eff['compute_pct']:.0f}% of step")
+        if eff["data_loading_pct"] > 0:
+            dl_note = f"{eff['data_loading_pct']:.0f}%"
+            if eff["data_loading_pct"] > 20:
+                dl_note += " — bottleneck candidate"
+            table.add_row("Data loading", f"{eff['data_loading_ms']:.1f} ms", dl_note)
+        if eff["other_pct"] > 0:
+            table.add_row("Other/overhead", f"{eff['other_ms']:.1f} ms", f"{eff['other_pct']:.0f}%")
 
     console.print(table)
     console.print()
@@ -500,9 +537,19 @@ def _print_efficiency_plain(result: DiagnoseResult) -> None:
     print(f"\n  Efficiency breakdown (estimated)")
     print(f"  Step time (p50): {eff['step_time_p50_ms']:.1f} ms")
     print(f"  {'─' * 40}")
-    print(f"  GPU compute:     {eff['compute_ms']:>8.1f} ms  ({eff['compute_pct']:.0f}%)")
-    if eff["data_loading_pct"] > 0:
-        print(f"  Data loading:    {eff['data_loading_ms']:>8.1f} ms  ({eff['data_loading_pct']:.0f}%)")
+
+    if eff.get("source") == "cuda_events":
+        print(f"  Forward:         {eff['forward_ms']:>8.1f} ms  ({eff['forward_pct']:.0f}%)")
+        print(f"  Backward:        {eff['backward_ms']:>8.1f} ms  ({eff['backward_pct']:.0f}%)")
+        if eff["optimizer_pct"] > 0:
+            print(f"  Optimizer:       {eff['optimizer_ms']:>8.1f} ms  ({eff['optimizer_pct']:.0f}%)")
+        if eff["data_loading_pct"] > 0:
+            print(f"  Data loading:    {eff['data_loading_ms']:>8.1f} ms  ({eff['data_loading_pct']:.0f}%)")
+    else:
+        print(f"  GPU compute:     {eff['compute_ms']:>8.1f} ms  ({eff['compute_pct']:.0f}%)")
+        if eff["data_loading_pct"] > 0:
+            print(f"  Data loading:    {eff['data_loading_ms']:>8.1f} ms  ({eff['data_loading_pct']:.0f}%)")
+
     bn = eff.get("bottleneck")
     if bn:
         print(f"\n  Bottleneck: {bn}")

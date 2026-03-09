@@ -576,6 +576,56 @@ def _find_distributed(
                         backend=None,
                     ))
 
+    # Lightning: pl.Trainer(...), Trainer from pytorch_lightning/lightning.pytorch
+    _lightning_prefixes = ("pytorch_lightning", "lightning.pytorch", "lightning")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fqn = _resolve_call_name(node, imports)
+        if fqn is None:
+            continue
+        # Direct match: pytorch_lightning.Trainer(...) or lightning.pytorch.Trainer(...)
+        if any(fqn.startswith(pfx) for pfx in _lightning_prefixes) and "Trainer" in fqn:
+            if not any(d.kind == "lightning" for d in results):
+                results.append(DistributedFinding(
+                    location=_loc(script_path, node, lines),
+                    kind="lightning",
+                    backend=None,
+                ))
+            break
+        # Import-resolved: Trainer imported from lightning
+        if fqn == "Trainer" or fqn.endswith(".Trainer"):
+            src = imports.get("Trainer", "")
+            if any(src.startswith(pfx) for pfx in _lightning_prefixes):
+                if not any(d.kind == "lightning" for d in results):
+                    results.append(DistributedFinding(
+                        location=_loc(script_path, node, lines),
+                        kind="lightning",
+                        backend=None,
+                    ))
+                break
+
+    # LightningModule subclass detection
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            base_name = None
+            if isinstance(base, ast.Name):
+                base_name = base.id
+            elif isinstance(base, ast.Attribute):
+                base_name = base.attr
+            if base_name == "LightningModule":
+                src = imports.get("LightningModule", "")
+                if not src or any(src.startswith(pfx) for pfx in _lightning_prefixes):
+                    if not any(d.kind == "lightning" for d in results):
+                        results.append(DistributedFinding(
+                            location=_loc(script_path, node, lines),
+                            kind="lightning",
+                            backend=None,
+                        ))
+                    break
+
     return results
 
 
@@ -972,6 +1022,10 @@ def _merge_imported_findings(
     # Merge optimizers
     for opt in _find_optimizers(tree, imports, lines, imported_path):
         main_findings.optimizers.append(opt)
+
+    # Merge fine-tuning findings
+    for ft in _find_fine_tuning(tree, imports, lines, imported_path):
+        main_findings.fine_tuning.append(ft)
 
     # Extract TrainingArguments from imported file
     sub_findings = CodeFindings(script_path=imported_path)
