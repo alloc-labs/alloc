@@ -234,6 +234,7 @@ def test_status_json_no_artifact(tmp_path, monkeypatch):
     import json
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # isolate from real ~/.alloc/config.json
     result = runner.invoke(app, ["status", "--json"])
     assert result.exit_code == 0
     data = json.loads(result.output.strip())
@@ -325,6 +326,7 @@ def test_status_not_logged_in(tmp_path, monkeypatch):
     """alloc status without token shows not-logged-in state."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ALLOC_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # isolate from real ~/.alloc/config.json
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     out = _plain(result.output)
