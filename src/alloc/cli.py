@@ -2147,6 +2147,13 @@ def login(
     ),
 ):
     """Authenticate with Alloc dashboard."""
+    # Suppress noisy third-party warnings (urllib3 LibreSSL, pynvml deprecation)
+    # that clutter the auth flow output.
+    import warnings
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
+    warnings.filterwarnings("ignore", message=".*LibreSSL.*", module="urllib3")
+    warnings.filterwarnings("ignore", message=".*pynvml.*", category=FutureWarning)
+
     import httpx
     from alloc.config import get_supabase_url, get_supabase_anon_key, load_config, save_config
 

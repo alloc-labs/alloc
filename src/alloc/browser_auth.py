@@ -41,7 +41,8 @@ def _find_open_port(start=17256, attempts=20):
     for port in range(start, start + attempts):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
+                # Bind to all interfaces so both localhost and 127.0.0.1 work
+                s.bind(("0.0.0.0", port))
                 return port
         except OSError:
             continue
@@ -109,7 +110,8 @@ def browser_login(
     verifier, challenge = _generate_pkce_pair()
     port = _find_open_port()
 
-    redirect_uri = f"http://localhost:{port}/callback"
+    # Use 127.0.0.1 (not localhost) — more reliable, avoids IPv6 resolution issues.
+    redirect_uri = f"http://127.0.0.1:{port}/callback"
 
     authorize_params = urlencode({
         "provider": provider,
@@ -119,7 +121,8 @@ def browser_login(
     })
     authorize_url = f"{supabase_url}/auth/v1/authorize?{authorize_params}"
 
-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    # Bind to 0.0.0.0 so both localhost and 127.0.0.1 reach the server.
+    server = HTTPServer(("0.0.0.0", port), _CallbackHandler)
     server.auth_code = None  # type: ignore[attr-defined]
     server.auth_error = None  # type: ignore[attr-defined]
     server.timeout = 1  # poll interval for handle_request()
@@ -129,16 +132,21 @@ def browser_login(
     server_thread.daemon = True
     server_thread.start()
 
+    import sys
+
     # Open the browser (or print URL as fallback).
     try:
         opened = webbrowser.open(authorize_url)
     except Exception:
         opened = False
 
+    print(f"\nCallback server listening on http://127.0.0.1:{port}/callback", file=sys.stderr)
     if not opened:
         print(f"\nOpen this URL in your browser to log in:\n\n  {authorize_url}\n")
     else:
-        print("Opened browser for login. Waiting for callback...")
+        print("Opened browser for login. Waiting for callback...", file=sys.stderr)
+        print(f"If login completes but the terminal stays stuck, your Supabase", file=sys.stderr)
+        print(f"redirect allowlist may not include http://127.0.0.1:{port}/callback", file=sys.stderr)
 
     server_thread.join(timeout=timeout_seconds + 5)
     server.server_close()
@@ -147,7 +155,20 @@ def browser_login(
         raise RuntimeError(f"OAuth error: {server.auth_error}")
 
     if not server.auth_code:
-        raise RuntimeError("Login timed out — no callback received within 120 seconds.")
+        raise RuntimeError(
+            f"Login timed out — no callback received within {timeout_seconds} seconds.\n"
+            f"\n"
+            f"  The browser never reached http://127.0.0.1:{port}/callback.\n"
+            f"\n"
+            f"  Common causes:\n"
+            f"  1. Supabase redirect allowlist does not include http://127.0.0.1:{port}/**\n"
+            f"     (Check: Supabase Dashboard → Authentication → URL Configuration → Redirect URLs)\n"
+            f"  2. Browser redirected to your site URL instead of localhost\n"
+            f"  3. Firewall or antivirus blocked the local callback server\n"
+            f"\n"
+            f"  Workaround: alloc login --method token --token <paste-access-token>\n"
+            f"  (Copy token from browser DevTools → Application → Local Storage → sb-*-auth-token)"
+        )
 
     # Exchange auth code + verifier for tokens.
     with httpx.Client(timeout=15) as client:
