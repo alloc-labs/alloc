@@ -2107,7 +2107,12 @@ def scan(
             _print_scan_result(result, gpu, strategy)
     except httpx.HTTPStatusError as e:
         if json_output:
-            _print_json({"error": f"API error {e.response.status_code}"})
+            detail = ""
+            try:
+                detail = e.response.json().get("detail", "")
+            except Exception:
+                pass
+            _print_json({"error": f"API error {e.response.status_code}", "detail": detail})
         elif e.response.status_code == 403:
             console.print("[yellow]AI analysis requires a Pro or Enterprise plan.[/yellow]")
             console.print("[dim]The scan still works — just without AI-powered analysis.[/dim]")

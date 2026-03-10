@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from alloc.probe import _discover_gpu_indices, _get_child_pids, ProbeResult
+from alloc.probe import (
+    _discover_gpu_indices,
+    _get_child_pids,
+    _parse_launcher_gpu_count,
+    ProbeResult,
+)
 
 
 def _mock_pynvml_multi_gpu(proc_pid, gpu_process_map):
@@ -112,3 +117,76 @@ def test_probe_result_defaults_single_gpu():
     result = ProbeResult()
     assert result.num_gpus_detected == 1
     assert result.process_map is None
+
+
+# ── Launcher command-line parsing ──
+
+
+def test_parse_torchrun_equals():
+    assert _parse_launcher_gpu_count(["torchrun", "--nproc_per_node=2", "train.py"]) == 2
+
+
+def test_parse_torchrun_space():
+    assert _parse_launcher_gpu_count(["torchrun", "--nproc_per_node", "4", "train.py"]) == 4
+
+
+def test_parse_torchrun_hyphen():
+    assert _parse_launcher_gpu_count(["torchrun", "--nproc-per-node=8", "train.py"]) == 8
+
+
+def test_parse_accelerate_equals():
+    assert _parse_launcher_gpu_count(["accelerate", "launch", "--num_processes=4", "train.py"]) == 4
+
+
+def test_parse_accelerate_hyphen_space():
+    assert _parse_launcher_gpu_count(["accelerate", "launch", "--num-processes", "8", "train.py"]) == 8
+
+
+def test_parse_deepspeed_equals():
+    assert _parse_launcher_gpu_count(["deepspeed", "--num_gpus=4", "train.py"]) == 4
+
+
+def test_parse_deepspeed_hyphen_space():
+    assert _parse_launcher_gpu_count(["deepspeed", "--num-gpus", "2", "train.py"]) == 2
+
+
+def test_parse_mpirun():
+    assert _parse_launcher_gpu_count(["mpirun", "-np", "8", "python", "train.py"]) == 8
+
+
+def test_parse_plain_python():
+    assert _parse_launcher_gpu_count(["python", "train.py"]) is None
+
+
+def test_parse_torch_distributed_launch():
+    assert _parse_launcher_gpu_count([
+        "python", "-m", "torch.distributed.launch", "--nproc_per_node=2", "train.py"
+    ]) == 2
+
+
+# ── Active-GPU fallback discovery ──
+
+
+def test_active_gpu_fallback_when_pid_mismatch():
+    """When PID matching fails but GPUs have active compute processes,
+    and expected_gpus matches, use active GPUs."""
+    mock = _mock_pynvml_multi_gpu(
+        proc_pid=1000,
+        gpu_process_map={0: [9999], 1: [8888]},  # PIDs don't match 1000
+    )
+    with patch("alloc.probe._get_child_pids", return_value=[]):
+        with patch("alloc.probe._read_child_env", return_value=None):
+            result = _discover_gpu_indices(1000, mock, fallback_index=0, expected_gpus=2)
+    assert result == [0, 1]
+
+
+def test_active_gpu_fallback_not_used_without_expected():
+    """Without expected_gpus, active GPU fallback is not used."""
+    mock = _mock_pynvml_multi_gpu(
+        proc_pid=1000,
+        gpu_process_map={0: [9999], 1: [8888]},
+    )
+    with patch("alloc.probe._get_child_pids", return_value=[]):
+        with patch("alloc.probe._read_child_env", return_value=None):
+            result = _discover_gpu_indices(1000, mock, fallback_index=0)
+    assert result == [0]  # Falls back to default

@@ -83,6 +83,85 @@ def _try_import_pynvml():
 
 
 
+def _parse_launcher_gpu_count(command):
+    # type: (list) -> Optional[int]
+    """Extract expected GPU count from launcher command line.
+
+    Recognizes: torchrun, torch.distributed.launch, accelerate launch,
+    deepspeed, mpirun/mpiexec.
+    """
+    args = [str(a) for a in command]
+    cmd_str = " ".join(args)
+
+    # torchrun --nproc_per_node=N or --nproc-per-node=N
+    for i, a in enumerate(args):
+        for flag in ("--nproc_per_node", "--nproc-per-node"):
+            if a.startswith(flag + "="):
+                try:
+                    return int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif a == flag and i + 1 < len(args):
+                try:
+                    return int(args[i + 1])
+                except ValueError:
+                    pass
+
+    # accelerate launch --num_processes=N or --num-processes=N
+    for i, a in enumerate(args):
+        for flag in ("--num_processes", "--num-processes"):
+            if a.startswith(flag + "="):
+                try:
+                    return int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif a == flag and i + 1 < len(args):
+                try:
+                    return int(args[i + 1])
+                except ValueError:
+                    pass
+
+    # deepspeed --num_gpus=N or --num-gpus=N
+    for i, a in enumerate(args):
+        for flag in ("--num_gpus", "--num-gpus"):
+            if a.startswith(flag + "="):
+                try:
+                    return int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif a == flag and i + 1 < len(args):
+                try:
+                    return int(args[i + 1])
+                except ValueError:
+                    pass
+
+    # mpirun/mpiexec -np N or -n N
+    for i, a in enumerate(args):
+        if a in ("-np", "-n") and i + 1 < len(args):
+            if any(x in cmd_str for x in ("mpirun", "mpiexec")):
+                try:
+                    return int(args[i + 1])
+                except ValueError:
+                    pass
+
+    return None
+
+
+def _read_child_env(pid, var_name):
+    # type: (int, str) -> Optional[str]
+    """Read an environment variable from a child process via /proc (Linux only)."""
+    try:
+        env_path = "/proc/{}/environ".format(pid)
+        with open(env_path, "rb") as f:
+            env_data = f.read()
+        for entry in env_data.split(b"\x00"):
+            if entry.startswith(var_name.encode() + b"="):
+                return entry.split(b"=", 1)[1].decode("utf-8")
+    except Exception:
+        pass
+    return None
+
+
 def _get_child_pids(pid):
     # type: (int) -> List[int]
     """Get child PIDs of a process. Returns empty list on failure."""
@@ -101,11 +180,15 @@ def _get_child_pids(pid):
     return []
 
 
-def _discover_gpu_indices(proc_pid, pynvml, fallback_index=0):
-    # type: (int, ..., int) -> List[int]
+def _discover_gpu_indices(proc_pid, pynvml, fallback_index=0, expected_gpus=None):
+    # type: (int, ..., int, Optional[int]) -> List[int]
     """Discover which GPUs a process (and its children) are using.
 
-    Iterates all GPU devices and checks running compute processes.
+    Two strategies:
+    1. PID-matching: walks process tree, matches PIDs against NVML compute processes.
+    2. Active-GPU counting: counts GPUs with ANY compute processes. Used when PID
+       matching finds fewer GPUs than expected (common for DDP launchers).
+
     Falls back to [fallback_index] if discovery fails or finds nothing.
     """
     try:
@@ -143,17 +226,64 @@ def _discover_gpu_indices(proc_pid, pynvml, fallback_index=0):
             for ggchild in _get_child_pids(grandchild):
                 target_pids.add(ggchild)
 
+    # Also try reading WORLD_SIZE from child process environments (Linux)
+    child_world_size = None
+    for child in _get_child_pids(proc_pid):
+        ws = _read_child_env(child, "WORLD_SIZE")
+        if ws:
+            try:
+                child_world_size = int(ws)
+            except ValueError:
+                pass
+            break
+        for grandchild in _get_child_pids(child):
+            ws = _read_child_env(grandchild, "WORLD_SIZE")
+            if ws:
+                try:
+                    child_world_size = int(ws)
+                except ValueError:
+                    pass
+                break
+            for ggchild in _get_child_pids(grandchild):
+                ws = _read_child_env(ggchild, "WORLD_SIZE")
+                if ws:
+                    try:
+                        child_world_size = int(ws)
+                    except ValueError:
+                        pass
+                    break
+
+    # Determine how many GPUs we expect
+    effective_expected = expected_gpus
+    if child_world_size is not None:
+        if effective_expected is None or child_world_size > effective_expected:
+            effective_expected = child_world_size
+
+    # Strategy 1: PID-based matching
     found_indices = []
+    active_indices = []  # GPUs with ANY compute processes
     for idx in search_indices:
         try:
             handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            if procs:
+                active_indices.append(idx)
             for p in procs:
                 if p.pid in target_pids:
                     found_indices.append(idx)
                     break
         except Exception:
             continue
+
+    # Strategy 2: If PID matching found fewer than expected, use active GPU count.
+    # This handles the common case where DDP workers are running but their PIDs
+    # weren't in our process tree (e.g., process group isolation, timing issues).
+    if effective_expected is not None and len(found_indices) < effective_expected:
+        if len(active_indices) >= effective_expected:
+            return active_indices[:effective_expected]
+        # Even if active < expected, active is better than found
+        if len(active_indices) > len(found_indices):
+            return active_indices
 
     return found_indices if found_indices else [fallback_index]
 
@@ -310,12 +440,17 @@ def probe_command(
             discovery_attempts = 0
             max_discovery_attempts = 3  # Retry at samples 5, 15, 30
 
-            # Determine expected GPU count from environment for retry logic
+            # Determine expected GPU count from command line + environment
             expected_gpus = 1
+            launcher_gpus = _parse_launcher_gpu_count(command)
+            if launcher_gpus is not None and launcher_gpus > 1:
+                expected_gpus = launcher_gpus
             ws = os.environ.get("WORLD_SIZE", "").strip()
             if ws:
                 try:
-                    expected_gpus = max(1, int(ws))
+                    ws_int = max(1, int(ws))
+                    if ws_int > expected_gpus:
+                        expected_gpus = ws_int
                 except ValueError:
                     pass
 
@@ -329,7 +464,10 @@ def probe_command(
                     and proc.pid):
                     discovery_attempts += 1
                     try:
-                        discovered = _discover_gpu_indices(proc.pid, pynvml, fallback_index=gpu_index)
+                        discovered = _discover_gpu_indices(
+                            proc.pid, pynvml, fallback_index=gpu_index,
+                            expected_gpus=expected_gpus if expected_gpus > 1 else None,
+                        )
                         if len(discovered) > 1:
                             handles = []
                             pmap = []
@@ -456,9 +594,12 @@ def probe_command(
     if calibration_time_ref[0] is not None:
         cal_duration = round(calibration_time_ref[0] - start_time, 2)
 
-    # Environment-based fallback: if NVML discovery found fewer GPUs than
-    # WORLD_SIZE indicates, trust the environment. The probe may miss GPUs
+    # Final fallback: if NVML discovery found fewer GPUs than expected,
+    # trust the command-line / environment signals. The probe may miss GPUs
     # due to DDP per-rank CVD isolation or timing races.
+    launcher_count = _parse_launcher_gpu_count(command)
+    if launcher_count is not None and launcher_count > num_gpus_ref[0]:
+        num_gpus_ref[0] = launcher_count
     env_world = os.environ.get("WORLD_SIZE", "").strip()
     if env_world:
         try:
