@@ -7,7 +7,7 @@ _warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
 _warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
 del _warnings
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 from alloc.ghost import ghost, GhostReport
 from alloc.callbacks import AllocCallback as HuggingFaceCallback
