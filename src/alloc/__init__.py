@@ -9,7 +9,7 @@ _warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.cuda"
 _warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"torch\.cuda")
 del _warnings
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 from alloc.ghost import ghost, GhostReport
 from alloc.callbacks import AllocCallback as HuggingFaceCallback
