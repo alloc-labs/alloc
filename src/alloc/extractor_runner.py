@@ -217,7 +217,9 @@ def main():
         try:
             obj = getattr(module, attr_name)
             if isinstance(obj, nn.Module):
-                count, dtype_str = _count_params(obj)
+                # Unwrap DDP/FSDP wrappers to get the underlying model
+                unwrapped = getattr(obj, "module", obj)
+                count, dtype_str = _count_params(unwrapped)
                 if count > 0:
                     models.append((count, dtype_str, attr_name))
         except Exception:

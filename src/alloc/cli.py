@@ -16,7 +16,14 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from typing import List, Optional
+
+# Suppress noisy third-party warnings globally — pynvml deprecation and
+# urllib3 LibreSSL warnings clutter every CLI command on affected systems.
+warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
+warnings.filterwarnings("ignore", message=".*LibreSSL.*", module="urllib3")
 
 import typer
 from rich.console import Console
@@ -2152,18 +2159,30 @@ def login(
     ),
 ):
     """Authenticate with Alloc dashboard."""
-    # Suppress noisy third-party warnings (urllib3 LibreSSL, pynvml deprecation)
-    # that clutter the auth flow output.
-    import warnings
-    warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
-    warnings.filterwarnings("ignore", message=".*LibreSSL.*", module="urllib3")
-    warnings.filterwarnings("ignore", message=".*pynvml.*", category=FutureWarning)
-
     import httpx
     from alloc.config import get_supabase_url, get_supabase_anon_key, load_config, save_config
 
     # --- Browser OAuth flow ---
     if browser:
+        # Detect headless/SSH environments where browser login won't work
+        is_headless = (
+            not os.environ.get("DISPLAY")
+            and not os.environ.get("WAYLAND_DISPLAY")
+            and sys.platform != "darwin"
+            and sys.platform != "win32"
+        )
+        is_ssh = bool(os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"))
+        if is_headless or is_ssh:
+            console.print("[yellow]Headless/SSH environment detected — browser login won't work here.[/yellow]")
+            console.print()
+            console.print("Use token login instead:")
+            console.print("  1. Log in at [cyan]https://alloclabs.com[/cyan] in your local browser")
+            console.print("  2. Open DevTools → Application → Local Storage → copy your access_token")
+            console.print("  3. Run: [green]alloc login --method token --token <paste-token>[/green]")
+            console.print()
+            console.print("[dim]Or set ALLOC_TOKEN=<token> in your environment.[/dim]")
+            raise typer.Exit(1)
+
         provider = (provider or "").strip().lower()
         if provider not in ("google", "azure"):
             console.print("[red]Invalid --provider. Use: google or azure[/red]")

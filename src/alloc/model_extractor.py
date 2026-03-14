@@ -99,6 +99,13 @@ def _extract_via_subprocess(
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ""  # prevent GPU allocation
+        # Set distributed env vars so DDP scripts don't crash on
+        # torch.distributed.init_process_group() during model extraction.
+        env.setdefault("RANK", "0")
+        env.setdefault("LOCAL_RANK", "0")
+        env.setdefault("WORLD_SIZE", "1")
+        env.setdefault("MASTER_ADDR", "127.0.0.1")
+        env.setdefault("MASTER_PORT", "29500")
 
         subprocess.run(
             [sys.executable, "-m", "alloc.extractor_runner", sidecar_path, script_abs],
