@@ -18,9 +18,15 @@ class TestStrategyInference:
                 num_gpus_detected=num_gpus,
             )
 
-    def test_no_degrees_strategy_none(self):
-        """When no degree env vars set, strategy should be None."""
-        result = self._topo({})
+    def test_no_degrees_multi_gpu_infers_ddp(self):
+        """When no degree env vars but multiple GPUs detected, infer DDP."""
+        result = self._topo({}, num_gpus=4)
+        assert result["strategy"] == "ddp"
+        assert result["dp_degree"] == 4
+
+    def test_single_gpu_no_degrees_strategy_none(self):
+        """Single GPU with no degrees → strategy stays None."""
+        result = self._topo({}, num_gpus=1)
         assert result["strategy"] is None
 
     def test_dp_only_is_ddp(self):

@@ -68,6 +68,34 @@ def test_whoami_not_logged_in_json(tmp_path: Path):
     assert data["api_url"] == "https://api.example.com"
 
 
+def test_whoami_stale_token_json(tmp_path: Path):
+    """Stale token should exit 0 with token_status: expired."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 401
+    mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Unauthorized", request=MagicMock(), response=mock_resp,
+    )
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = False
+    mock_client.get.return_value = mock_resp
+
+    env = {
+        "HOME": str(tmp_path),
+        "ALLOC_API_URL": "https://api.example.com",
+        "ALLOC_TOKEN": "stale-token",
+    }
+
+    with patch("httpx.Client", return_value=mock_client), \
+         patch("alloc.cli.try_refresh_access_token", return_value=None):
+        result = runner.invoke(app, ["whoami", "--json"], env=env)
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["logged_in"] is False
+    assert data["token_status"] == "expired"
+
+
 def test_whoami_logged_in_json(tmp_path: Path):
     profile_resp = MagicMock()
     profile_resp.raise_for_status.return_value = None
@@ -110,6 +138,7 @@ def test_whoami_logged_in_json(tmp_path: Path):
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["logged_in"] is True
+    assert data["token_status"] == "valid"
     assert data["token_source"] == "env"
     assert data["email"] == "user@example.com"
     assert data["fleet_count"] == 1

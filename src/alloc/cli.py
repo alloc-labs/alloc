@@ -2400,23 +2400,33 @@ def whoami(
             profile = _get("/profile")
             fleet = _get("/gpu-fleet")
         else:
-            if json_output:
+            # whoami is a status command — report structured result, exit 0
+            if e.response.status_code == 401:
+                out["token_status"] = "expired"
+            else:
+                out["token_status"] = "error"
                 out["error"] = f"API error {e.response.status_code}"
+            if json_output:
                 _print_json(out)
             else:
-                console.print(f"[red]API error {e.response.status_code}[/red]")
+                if e.response.status_code == 401:
+                    console.print("[yellow]Token expired.[/yellow]")
+                else:
+                    console.print(f"[red]API error {e.response.status_code}[/red]")
                 console.print("[dim]Run: alloc login[/dim]")
-            raise typer.Exit(1)
+            return
     except httpx.ConnectError:
+        out["token_status"] = "unreachable"
+        out["error"] = f"Cannot connect to {api_url}"
         if json_output:
-            out["error"] = f"Cannot connect to {api_url}"
             _print_json(out)
         else:
             console.print(f"[red]Cannot connect to {api_url}[/red]")
-        raise typer.Exit(1)
+        return
 
     # API validated the token — now we know login is real
     out["logged_in"] = True
+    out["token_status"] = "valid"
 
     gpus = fleet.get("gpus") or []
     fleet_count = len([g for g in gpus if g.get("fleet_status") == "in_fleet"])
@@ -3565,7 +3575,14 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
         strategy = "pp+dp" if (dp is not None and dp > 1) else "pp"
     elif dp is not None and dp > 1:
         strategy = "ddp"
-    # If none of the above matched, strategy stays None (unknown)
+    elif strategy is None and num_gpus_detected > 1 and not has_tp and not has_pp:
+        # Multiple GPUs detected via NVML with no TP/PP env vars →
+        # DDP is PyTorch's default and the only realistic inference.
+        # This is NOT the old `or "ddp"` — it only fires when probe
+        # actually observed multiple GPU processes.
+        strategy = "ddp"
+        if dp is None:
+            dp = num_gpus_detected
 
     return {
         "num_nodes": nnodes or 1,

@@ -281,7 +281,30 @@ def main():
             "activation_method": activation_result.get("activation_method"),
         }
     else:
-        result = {"status": "no_model"}
+        # No model found — check if this is a distributed training script
+        # that hides the model inside __main__ guard or main()
+        _is_dist = False
+        try:
+            import torch.distributed as _dist_mod
+            if _dist_mod.is_initialized():
+                _is_dist = True
+        except Exception:
+            pass
+        if not _is_dist:
+            # Check if module imported distributed primitives
+            for attr_name in dir(module):
+                try:
+                    obj = getattr(module, attr_name)
+                    mod_name = getattr(obj, "__module__", "") or ""
+                    if "torch.distributed" in mod_name or "torch.nn.parallel" in mod_name:
+                        _is_dist = True
+                        break
+                except Exception:
+                    continue
+        if _is_dist:
+            result = {"status": "error_distributed", "error": "no model found — script uses distributed training"}
+        else:
+            result = {"status": "no_model"}
 
     with open(sidecar_path, "w") as f:
         json.dump(result, f)
