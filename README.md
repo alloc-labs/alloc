@@ -12,7 +12,7 @@ alloc run python train.py
 ```
 
 ```
-alloc v0.0.2 — Calibrate
+alloc v0.0.8 — Calibrate
 
  Run Summary
   Peak VRAM       31.2 GB / 40.0 GB (A100)
