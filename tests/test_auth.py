@@ -223,6 +223,7 @@ def test_browser_login_saves_tokens(tmp_path: Path):
     env = {
         "HOME": str(tmp_path),
         "ALLOC_API_URL": "https://api.example.com",
+        "DISPLAY": ":0",  # prevent headless detection in CI
     }
 
     with patch("alloc.browser_auth.browser_login", return_value=mock_result):
@@ -248,6 +249,7 @@ def test_browser_login_with_azure_provider(tmp_path: Path):
     env = {
         "HOME": str(tmp_path),
         "ALLOC_API_URL": "https://api.example.com",
+        "DISPLAY": ":0",
     }
 
     with patch("alloc.browser_auth.browser_login", return_value=mock_result) as mock_bl:
@@ -263,7 +265,7 @@ def test_browser_login_with_azure_provider(tmp_path: Path):
 
 
 def test_browser_login_invalid_provider(tmp_path: Path):
-    env = {"HOME": str(tmp_path)}
+    env = {"HOME": str(tmp_path), "DISPLAY": ":0"}
     result = runner.invoke(
         app, ["login", "--browser", "--provider", "facebook"], env=env
     )
@@ -271,10 +273,19 @@ def test_browser_login_invalid_provider(tmp_path: Path):
     assert "Invalid --provider" in result.output
 
 
+def test_browser_login_headless_detection(tmp_path: Path):
+    """In headless/SSH environment, browser login should fail with guidance."""
+    env = {"HOME": str(tmp_path), "SSH_CLIENT": "1.2.3.4 1234 22", "DISPLAY": ":0"}
+    result = runner.invoke(app, ["login", "--browser"], env=env)
+    assert result.exit_code != 0
+    assert "Headless" in result.output or "token" in result.output
+
+
 def test_browser_login_timeout(tmp_path: Path):
     env = {
         "HOME": str(tmp_path),
         "ALLOC_API_URL": "https://api.example.com",
+        "DISPLAY": ":0",
     }
 
     with patch(
