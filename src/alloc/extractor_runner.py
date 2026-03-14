@@ -206,7 +206,11 @@ def main():
         except SystemExit:
             pass  # catch real SystemExit too
     except Exception as e:
-        result = {"status": "error", "error": str(e)[:200]}
+        error_msg = str(e)[:500]
+        _dist_keywords = ("init_process_group", "nccl", "gloo", "distributed",
+                          "master_addr", "master_port", "rendezvouserror")
+        status = "error_distributed" if any(kw in error_msg.lower() for kw in _dist_keywords) else "error"
+        result = {"status": status, "error": error_msg}
         with open(sidecar_path, "w") as f:
             json.dump(result, f)
         return

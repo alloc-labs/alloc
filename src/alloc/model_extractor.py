@@ -108,6 +108,10 @@ def _extract_via_subprocess(
         env.setdefault("WORLD_SIZE", "1")
         env.setdefault("MASTER_ADDR", "127.0.0.1")
         env.setdefault("MASTER_PORT", "29500")
+        # Suppress pynvml/torch.cuda deprecation warnings in subprocess
+        existing = env.get("PYTHONWARNINGS", "")
+        filters = "ignore::FutureWarning,ignore::DeprecationWarning"
+        env["PYTHONWARNINGS"] = f"{existing},{filters}" if existing else filters
 
         subprocess.run(
             [sys.executable, "-m", "alloc.extractor_runner", sidecar_path, script_abs],
@@ -137,11 +141,16 @@ def _extract_via_subprocess(
             )
 
         # Structured degradation for distributed scripts
-        if data.get("status") == "error":
-            error_msg = data.get("error", "")
-            _dist_keywords = ("init_process_group", "NCCL", "gloo", "distributed",
-                              "MASTER_ADDR", "MASTER_PORT", "RendezvousError")
-            if any(kw.lower() in error_msg.lower() for kw in _dist_keywords):
+        status = data.get("status", "")
+        if status in ("error", "error_distributed"):
+            is_distributed = status == "error_distributed"
+            if not is_distributed:
+                # Fallback keyword match for older sidecar format
+                error_msg = data.get("error", "")
+                _dist_keywords = ("init_process_group", "NCCL", "gloo", "distributed",
+                                  "MASTER_ADDR", "MASTER_PORT", "RendezvousError")
+                is_distributed = any(kw.lower() in error_msg.lower() for kw in _dist_keywords)
+            if is_distributed:
                 return ModelInfo(
                     param_count=0,
                     dtype="float16",

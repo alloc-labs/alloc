@@ -123,6 +123,7 @@ def upload_artifact(artifact_path: str, api_url: str, token: str) -> dict:
         "dataloader_wait_pct": probe.get("dataloader_wait_pct"),
         "comm_overhead_pct": probe.get("comm_overhead_pct"),
         "per_rank_peak_vram_mb": probe.get("per_rank_peak_vram_mb"),
+        "process_map": probe.get("process_map"),
         # Architecture fields: probe (callbacks) takes priority over ghost defaults
         "batch_size": probe.get("batch_size") or (ghost.get("batch_size") if ghost else None),
         "seq_length": ghost.get("seq_length") if ghost else None,

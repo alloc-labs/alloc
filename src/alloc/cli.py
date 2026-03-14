@@ -455,7 +455,9 @@ def run(
             "tp_degree": topology.get("tp_degree"),
             "pp_degree": topology.get("pp_degree"),
             "dp_degree": topology.get("dp_degree"),
+            "strategy": topology.get("strategy"),
             "interconnect_type": topology.get("interconnect_type"),
+            "process_map": result.process_map,
             "objective": objective,
             "max_budget_hourly": max_budget_hourly,
             "command": " ".join(command),
@@ -2368,7 +2370,7 @@ def whoami(
 
     out = {
         "api_url": api_url,
-        "logged_in": bool(token),
+        "logged_in": False,
         "token_source": token_source if token else None,
     }
 
@@ -2412,6 +2414,9 @@ def whoami(
         else:
             console.print(f"[red]Cannot connect to {api_url}[/red]")
         raise typer.Exit(1)
+
+    # API validated the token — now we know login is real
+    out["logged_in"] = True
 
     gpus = fleet.get("gpus") or []
     fleet_count = len([g for g in gpus if g.get("fleet_status") == "in_fleet"])
@@ -3087,7 +3092,7 @@ def status(
 
     out = {
         "version": __version__,
-        "logged_in": bool(token),
+        "has_token": bool(token),
         "api_url": api_url,
         "artifact": None,
         "dashboard_url": None,
@@ -3548,6 +3553,20 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
     if interconnect not in ("pcie", "nvlink", "nvlink_switch", "nvlink_p2p", "infiniband", "unknown"):
         interconnect = "unknown"
 
+    # Infer strategy from degrees — only when evidence exists
+    strategy = None
+    has_tp = tp is not None and tp > 1
+    has_pp = pp is not None and pp > 1
+    if has_tp and has_pp:
+        strategy = "tp+pp+dp"
+    elif has_tp:
+        strategy = "tp+dp" if (dp is not None and dp > 1) else "tp"
+    elif has_pp:
+        strategy = "pp+dp" if (dp is not None and dp > 1) else "pp"
+    elif dp is not None and dp > 1:
+        strategy = "ddp"
+    # If none of the above matched, strategy stays None (unknown)
+
     return {
         "num_nodes": nnodes or 1,
         "gpus_per_node": gpn,
@@ -3555,6 +3574,7 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
         "pp_degree": pp,
         "dp_degree": dp,
         "interconnect_type": interconnect,
+        "strategy": strategy,
     }
 
 

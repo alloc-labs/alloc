@@ -363,7 +363,7 @@ def probe_command(
     """
     pynvml = _try_import_pynvml()
 
-    # Launch the subprocess
+    # Launch the user's training subprocess — do NOT modify env (their warnings matter)
     try:
         proc = subprocess.Popen(
             command,

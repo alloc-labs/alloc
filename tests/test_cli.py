@@ -239,7 +239,7 @@ def test_status_json_no_artifact(tmp_path, monkeypatch):
     assert result.exit_code == 0
     data = json.loads(result.output.strip())
     assert data["artifact"] is None
-    assert data["logged_in"] is False
+    assert data["has_token"] is False
     assert "version" in data
 
 
