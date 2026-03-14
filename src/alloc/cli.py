@@ -19,10 +19,12 @@ import sys
 import warnings
 from typing import List, Optional
 
-# Suppress noisy third-party warnings globally — pynvml deprecation and
-# urllib3 LibreSSL warnings clutter every CLI command on affected systems.
+# Suppress noisy third-party warnings globally — pynvml deprecation (emitted
+# from torch.cuda.__init__) and urllib3 LibreSSL warnings clutter CLI output.
 warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.cuda")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"torch\.cuda")
 warnings.filterwarnings("ignore", message=".*LibreSSL.*", module="urllib3")
 
 import typer
@@ -73,6 +75,19 @@ def ghost(
             console.print(f"[yellow]Could not extract model from {script}.[/yellow]")
             console.print("[dim]Supported: PyTorch nn.Module, HuggingFace AutoModel, Lightning modules.[/dim]")
             console.print(f"[dim]Tip: alloc ghost {script} --param-count-b 7.0[/dim]")
+        raise typer.Exit(1)
+
+    if info.extraction_error:
+        if json_output:
+            _print_json({
+                "error": info.extraction_error,
+                "detail": info.extraction_detail,
+                "supported": False,
+            })
+        else:
+            console.print(f"[yellow]{info.extraction_detail}[/yellow]")
+            if info.extraction_error == "distributed_entrypoint":
+                console.print("[dim]Tip: alloc ghost model.py  (point to the file that defines your model)[/dim]")
         raise typer.Exit(1)
 
     # Use dtype from execution if available, otherwise CLI flag
@@ -2099,12 +2114,32 @@ def scan(
 
     try:
         headers = {"Content-Type": "application/json"}
+        used_auth = bool(token)
+
         if token:
             headers["Authorization"] = f"Bearer {token}"
+            endpoint = "/scans"
+        else:
+            endpoint = "/scans/cli"
 
-        endpoint = "/scans" if token else "/scans/cli"
         with httpx.Client(timeout=30) as client:
             resp = client.post(f"{api_url}{endpoint}", json=payload, headers=headers)
+
+            # On 401 with a saved token: try refresh, then fall back to public endpoint
+            if resp.status_code == 401 and used_auth:
+                new_token = try_refresh_access_token()
+                if new_token:
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    resp = client.post(f"{api_url}/scans", json=payload, headers=headers)
+                else:
+                    # Token refresh failed — fall back to unauthenticated scan
+                    console.print(
+                        "[yellow]Session expired — falling back to public scan "
+                        "(org fleet context unavailable). Run `alloc login` to restore.[/yellow]",
+                    )
+                    del headers["Authorization"]
+                    resp = client.post(f"{api_url}/scans/cli", json=payload, headers=headers)
+
             resp.raise_for_status()
             result = resp.json()
 

@@ -18,6 +18,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
+_warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
+_warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.cuda")
+_warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"torch\.cuda")
+del _warnings
+
 
 class StopReason(str, Enum):
     STABLE = "stable"

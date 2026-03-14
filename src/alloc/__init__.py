@@ -5,6 +5,8 @@ from __future__ import annotations
 import warnings as _warnings
 _warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
 _warnings.filterwarnings("ignore", category=DeprecationWarning, module="pynvml")
+_warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.cuda")
+_warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"torch\.cuda")
 del _warnings
 
 __version__ = "0.0.6"

@@ -33,6 +33,8 @@ class ModelInfo:
     seq_length: Optional[int] = None
     activation_memory_bytes: Optional[int] = None
     activation_method: Optional[str] = None  # "traced" | None
+    extraction_error: Optional[str] = None   # "distributed_entrypoint" | None
+    extraction_detail: Optional[str] = None  # human-readable explanation
 
 
 def extract_model_info(
@@ -133,6 +135,24 @@ def _extract_via_subprocess(
                 activation_memory_bytes=data.get("activation_memory_bytes"),
                 activation_method=data.get("activation_method"),
             )
+
+        # Structured degradation for distributed scripts
+        if data.get("status") == "error":
+            error_msg = data.get("error", "")
+            _dist_keywords = ("init_process_group", "NCCL", "gloo", "distributed",
+                              "MASTER_ADDR", "MASTER_PORT", "RendezvousError")
+            if any(kw.lower() in error_msg.lower() for kw in _dist_keywords):
+                return ModelInfo(
+                    param_count=0,
+                    dtype="float16",
+                    model_name=None,
+                    method="execution",
+                    extraction_error="distributed_entrypoint",
+                    extraction_detail=(
+                        "Script requires a distributed runtime (e.g. torchrun). "
+                        "Run ghost on the model definition file instead of the launcher script."
+                    ),
+                )
 
         return None
 
