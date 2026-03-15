@@ -215,8 +215,19 @@ def _discover_gpu_indices(proc_pid, pynvml, fallback_index=0, expected_gpus=None
                     if 0 <= idx < device_count:
                         visible_physical.append(idx)
                 except ValueError:
-                    visible_physical = list(range(device_count))
-                    break
+                    # UUID-style device identifiers — try NVML UUID matching
+                    try:
+                        for phys_idx in range(device_count):
+                            handle = pynvml.nvmlDeviceGetHandleByIndex(phys_idx)
+                            uuid = pynvml.nvmlDeviceGetUUID(handle)
+                            if isinstance(uuid, bytes):
+                                uuid = uuid.decode("utf-8", errors="replace")
+                            if d in uuid:
+                                visible_physical.append(phys_idx)
+                                break
+                    except Exception:
+                        visible_physical = list(range(device_count))
+                        break
         search_indices = visible_physical if visible_physical else list(range(device_count))
     else:
         search_indices = list(range(device_count))

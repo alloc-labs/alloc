@@ -359,3 +359,15 @@ def test_estimate_model_params_known_vision_model():
 
     result = _estimate_model_params("stable-diffusion")
     assert result == 0.865
+
+
+def test_estimate_model_params_gpt2_medium_prefix_match():
+    """gpt2-medium-finetuned should match gpt2-medium (0.355), not gpt2 (0.124)."""
+    result = _estimate_model_params("gpt2-medium-finetuned")
+    assert result == 0.355
+
+
+def test_estimate_model_params_gpt2_alone():
+    """Plain gpt2 should still match 0.124."""
+    result = _estimate_model_params("gpt2")
+    assert result == 0.124

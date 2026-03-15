@@ -403,7 +403,7 @@ def _estimate_model_params(model_name: str) -> Optional[float]:
         "whisper-large": 1.55,
     }
 
-    for key, params in estimates.items():
+    for key, params in sorted(estimates.items(), key=lambda x: len(x[0]), reverse=True):
         if key in name:
             return params
 

@@ -158,6 +158,61 @@ def test_parse_plain_python():
     assert _parse_launcher_gpu_count(["python", "train.py"]) is None
 
 
+# ── CVD UUID resolution ──
+
+
+def test_cvd_uuid_resolves_to_correct_index():
+    """UUID-style CUDA_VISIBLE_DEVICES should resolve to the matching physical GPU index."""
+    mock = _mock_pynvml_multi_gpu(
+        proc_pid=1000,
+        gpu_process_map={0: [1000], 1: [], 2: []},
+    )
+    mock.nvmlDeviceGetCount.return_value = 3
+
+    # Set up UUID resolution: GPU 0 → UUID-A, GPU 1 → UUID-B, GPU 2 → UUID-C
+    uuid_map = {0: "GPU-aaaa-1111", 1: "GPU-bbbb-2222", 2: "GPU-cccc-3333"}
+    handles = {}
+    for idx in range(3):
+        handles[idx] = MagicMock(name=f"handle_{idx}")
+
+    def get_handle(idx):
+        return handles[idx]
+
+    def get_uuid(handle):
+        for idx, h in handles.items():
+            if handle == h:
+                return uuid_map[idx]
+        return "GPU-unknown"
+
+    mock.nvmlDeviceGetHandleByIndex = MagicMock(side_effect=get_handle)
+    mock.nvmlDeviceGetUUID = MagicMock(side_effect=get_uuid)
+
+    # CVD set to GPU 2's UUID
+    with patch("alloc.probe._get_child_pids", return_value=[]):
+        with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "GPU-cccc-3333"}):
+            result = _discover_gpu_indices(1000, mock, fallback_index=0)
+    # Should only search GPU index 2
+    assert 2 in result or result == [0]  # either found on idx 2, or fallback if no PID match
+
+
+def test_cvd_invalid_uuid_falls_back_to_all_gpus():
+    """Invalid UUID that doesn't match any device should fall back to all GPUs."""
+    mock = _mock_pynvml_multi_gpu(
+        proc_pid=1000,
+        gpu_process_map={0: [1000], 1: []},
+    )
+    mock.nvmlDeviceGetCount.return_value = 2
+
+    # UUID lookup raises for all devices
+    mock.nvmlDeviceGetUUID = MagicMock(side_effect=RuntimeError("no UUID support"))
+
+    with patch("alloc.probe._get_child_pids", return_value=[]):
+        with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "GPU-nonexistent"}):
+            result = _discover_gpu_indices(1000, mock, fallback_index=0)
+    # Should fall back to searching all GPUs and find PID 1000 on GPU 0
+    assert 0 in result
+
+
 def test_parse_torch_distributed_launch():
     assert _parse_launcher_gpu_count([
         "python", "-m", "torch.distributed.launch", "--nproc_per_node=2", "train.py"

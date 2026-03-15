@@ -121,8 +121,9 @@ def browser_login(
     })
     authorize_url = f"{supabase_url}/auth/v1/authorize?{authorize_params}"
 
-    # Bind to 0.0.0.0 so both localhost and 127.0.0.1 reach the server.
-    server = HTTPServer(("0.0.0.0", port), _CallbackHandler)
+    # Bind to 127.0.0.1 only — the auth callback server should never be
+    # reachable from the network.
+    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
     server.auth_code = None  # type: ignore[attr-defined]
     server.auth_error = None  # type: ignore[attr-defined]
     server.timeout = 1  # poll interval for handle_request()

@@ -501,7 +501,10 @@ class _NvmlMonitor:
 
             self._hw_context["nvlink_active_links"] = active_links
         except Exception:
-            pass
+            # NVLink detection code failed after entering the try block.
+            # We know NVML is functional (handles exist), so fall back to
+            # generic "nvlink" rather than leaving interconnect_type unset.
+            self._hw_context["interconnect_type"] = "nvlink"
 
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()

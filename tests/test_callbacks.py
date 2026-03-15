@@ -1189,3 +1189,71 @@ class TestNvmlMonitorThreadSafety:
         assert len(probe["per_rank_peak_vram_mb"]) == 2
         for peak in probe["per_rank_peak_vram_mb"]:
             assert peak > 0
+
+
+class TestNvmlMonitorNvlinkFallback:
+    def test_nvlink_detection_failure_sets_nvlink_fallback(self):
+        """When the outer NVLink detection block raises, fall back to 'nvlink'.
+
+        We trigger this by making nvmlDeviceGetNvLinkState raise on the first
+        call (inner except breaks the loop → active_links=0 → 'pcie'), and
+        then making the active_links comparison itself blow up. The simplest
+        trigger is having _gpu_handles[0] raise IndexError (empty list after
+        the early-return guard).
+        """
+        mock_pynvml = MagicMock()
+        mock_pynvml.nvmlInit.return_value = None
+        mock_pynvml.nvmlShutdown.return_value = None
+        mock_pynvml.nvmlDeviceGetCount.return_value = 2
+        mock_pynvml.nvmlDeviceGetName.return_value = "NVIDIA A100-SXM4-80GB"
+        mem = SimpleNamespace(total=80 * 1024**3, used=1 * 1024**3)
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem
+        mock_pynvml.nvmlSystemGetDriverVersion.return_value = "535"
+        mock_pynvml.nvmlSystemGetCudaDriverVersion.return_value = 12000
+        mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (8, 0)
+        util = SimpleNamespace(gpu=75, memory=60)
+        mock_pynvml.nvmlDeviceGetUtilizationRates.return_value = util
+        mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 300000
+
+        # Use a handle list that passes the `if not self._gpu_handles` guard
+        # (it's truthy) but raises IndexError on `self._gpu_handles[0]`.
+        class BadHandleList:
+            """Truthy but raises on index access."""
+            def __bool__(self):
+                return True
+            def __len__(self):
+                return 2
+            def __iter__(self):
+                return iter([])
+            def __getitem__(self, idx):
+                raise IndexError("corrupted handle list")
+
+        with patch("alloc.callbacks._try_import_pynvml", return_value=mock_pynvml):
+            monitor = _NvmlMonitor()
+
+        # Replace handles after __init__ but before start().
+        # start() will re-populate from nvmlDeviceGetCount, so we also need to
+        # make the handle-building loop produce our bad list. We do this by
+        # patching nvmlDeviceGetHandleByIndex to raise, so _gpu_handles stays
+        # empty after the try/except in handle building. But that triggers
+        # the early return. Instead, we patch _gpu_handles AFTER start()
+        # builds them but BEFORE NVLink detection runs. We achieve this by
+        # having nvmlDeviceGetCudaComputeCapability (the last hw-context call
+        # before NVLink detection) swap in the bad handles as a side effect.
+        original_sm = mock_pynvml.nvmlDeviceGetCudaComputeCapability
+
+        def swap_handles_then_return_sm(handle):
+            monitor._gpu_handles = BadHandleList()
+            return (8, 0)
+
+        mock_pynvml.nvmlDeviceGetCudaComputeCapability = MagicMock(
+            side_effect=swap_handles_then_return_sm
+        )
+
+        monitor.start()
+        import time
+        time.sleep(0.02)
+        monitor.stop()
+
+        hw, _ = monitor.get_results()
+        assert hw.get("interconnect_type") == "nvlink"
