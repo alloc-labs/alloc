@@ -328,6 +328,7 @@ def run(
     no_config: bool = typer.Option(False, "--no-config", help="Skip .alloc.yaml (use catalog defaults)"),
     after: Optional[str] = typer.Option(None, "--after", help="Previous run ID to compare against (outcome tracking)"),
     experiment: Optional[str] = typer.Option(None, "--experiment", "-e", help="Experiment group name"),
+    strategy: Optional[str] = typer.Option(None, "--strategy", help="Override detected strategy (ddp, fsdp, deepspeed, tp, pp, etc.)"),
 ):
     """Run a training command with GPU monitoring."""
     from alloc.probe import probe_command
@@ -340,6 +341,18 @@ def run(
     if not command:
         console.print("[red]No command provided.[/red]")
         console.print("Usage: alloc run python train.py")
+        raise typer.Exit(1)
+
+    # Validate --strategy against API-accepted values
+    _VALID_STRATEGIES = {
+        "ddp", "fsdp", "deepspeed", "tp", "pp",
+        "tp+dp", "pp+dp", "tp+pp+dp", "tp+pp+fsdp",
+    }
+    if strategy and strategy.lower() not in _VALID_STRATEGIES:
+        console.print(
+            f"[red]Invalid --strategy '{strategy}'. "
+            f"Valid values: {', '.join(sorted(_VALID_STRATEGIES))}[/red]"
+        )
         raise typer.Exit(1)
 
     # ALLOC_POLICY: "warn" or "enforce" forces full monitoring
@@ -425,10 +438,25 @@ def run(
     # Discover environment context (git, container, Ray)
     from alloc.context import discover_context
     env_context = discover_context()
+
+    # AST strategy hint: detect FSDP/DDP/DeepSpeed from script source
+    ast_hint = None  # type: Optional[str]
+    try:
+        from alloc.code_analyzer import detect_strategy_hint
+        # Find the .py script in the command (e.g. "python train.py" or "torchrun ... train.py")
+        for arg in command:
+            if arg.endswith(".py") and os.path.isfile(arg):
+                ast_hint = detect_strategy_hint(arg)
+                break
+    except Exception:
+        pass  # Never crash on AST analysis failure
+
     topology = _infer_parallel_topology_from_env(
         num_gpus_detected=result.num_gpus_detected,
         config_interconnect=gpu_context.get("interconnect") if gpu_context else None,
         detected_interconnect=result.detected_interconnect,
+        strategy_override=strategy,
+        ast_strategy_hint=ast_hint,
     )
     objective = os.environ.get("ALLOC_OBJECTIVE", "").strip().lower() or _objective_from_context(gpu_context)
     max_budget_hourly = _max_budget_hourly_from_context(gpu_context)
@@ -456,6 +484,7 @@ def run(
             "pp_degree": topology.get("pp_degree"),
             "dp_degree": topology.get("dp_degree"),
             "strategy": topology.get("strategy"),
+            "strategy_detection_method": topology.get("strategy_detection_method"),
             "interconnect_type": topology.get("interconnect_type"),
             "process_map": result.process_map,
             "objective": objective,
@@ -3522,8 +3551,22 @@ def _print_gpu_context_detail(ctx: dict) -> None:
     console.print(Panel("\n".join(lines), title="GPU Context (.alloc.yaml)", border_style="cyan", padding=(1, 0)))
 
 
-def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_interconnect: Optional[str] = None, detected_interconnect: Optional[str] = None) -> dict:
-    """Infer distributed topology hints from common launcher env vars."""
+def _infer_parallel_topology_from_env(
+    *,
+    num_gpus_detected: int,
+    config_interconnect: Optional[str] = None,
+    detected_interconnect: Optional[str] = None,
+    strategy_override: Optional[str] = None,
+    ast_strategy_hint: Optional[str] = None,
+) -> dict:
+    """Infer distributed topology hints from common launcher env vars.
+
+    Strategy precedence:
+      1. --strategy override (user explicit)
+      2. AST hint (code_analyzer detected FSDP/DDP/DeepSpeed)
+      3. Env var inference (TP/PP/DP degrees)
+      4. None (unknown — never silently default to ddp)
+    """
 
     def _get_int(name: str) -> Optional[int]:
         val = os.environ.get(name)
@@ -3545,8 +3588,12 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
 
     tp = _get_int("TP_SIZE") or _get_int("TENSOR_PARALLEL_SIZE")
     pp = _get_int("PP_SIZE") or _get_int("PIPELINE_PARALLEL_SIZE")
-    dp = _get_int("DP_SIZE") or _get_int("DATA_PARALLEL_SIZE")
+    dp_explicit = _get_int("DP_SIZE") or _get_int("DATA_PARALLEL_SIZE")
+    dp = dp_explicit
 
+    # Derive dp from WORLD_SIZE when not explicitly set.
+    # This gives us the degree but does NOT imply strategy=ddp
+    # (WORLD_SIZE is set for both DDP and FSDP).
     if dp is None and world_size is not None:
         denom = (tp or 1) * (pp or 1)
         if denom > 0 and world_size % denom == 0:
@@ -3563,26 +3610,41 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
     if interconnect not in ("pcie", "nvlink", "nvlink_switch", "nvlink_p2p", "infiniband", "unknown"):
         interconnect = "unknown"
 
-    # Infer strategy from degrees — only when evidence exists
+    # Strategy detection with strict precedence and provenance tracking
     strategy = None
-    has_tp = tp is not None and tp > 1
-    has_pp = pp is not None and pp > 1
-    if has_tp and has_pp:
+    strategy_detection_method = None  # type: Optional[str]
+
+    # 1. Explicit --strategy override
+    if strategy_override:
+        strategy = strategy_override.lower()
+        strategy_detection_method = "user_override"
+    # 2. Env var inference from explicit TP/PP/DP degree env vars
+    #    TP_SIZE/PP_SIZE unambiguously identify the strategy.
+    #    DP_SIZE (explicit) implies DDP. But WORLD_SIZE-derived dp does NOT
+    #    imply DDP — FSDP uses the same WORLD_SIZE.
+    elif tp is not None and tp > 1 and pp is not None and pp > 1:
         strategy = "tp+pp+dp"
-    elif has_tp:
+        strategy_detection_method = "env_degrees"
+    elif tp is not None and tp > 1:
         strategy = "tp+dp" if (dp is not None and dp > 1) else "tp"
-    elif has_pp:
+        strategy_detection_method = "env_degrees"
+    elif pp is not None and pp > 1:
         strategy = "pp+dp" if (dp is not None and dp > 1) else "pp"
-    elif dp is not None and dp > 1:
+        strategy_detection_method = "env_degrees"
+    elif dp_explicit is not None and dp_explicit > 1:
         strategy = "ddp"
-    elif strategy is None and num_gpus_detected > 1 and not has_tp and not has_pp:
-        # Multiple GPUs detected via NVML with no TP/PP env vars →
-        # DDP is PyTorch's default and the only realistic inference.
-        # This is NOT the old `or "ddp"` — it only fires when probe
-        # actually observed multiple GPU processes.
-        strategy = "ddp"
+        strategy_detection_method = "env_degrees"
+    # 3. AST hint (code_analyzer detected FSDP/DDP/DeepSpeed in script)
+    elif ast_strategy_hint and num_gpus_detected > 1:
+        strategy = ast_strategy_hint
+        strategy_detection_method = "ast_analysis"
         if dp is None:
             dp = num_gpus_detected
+    # 4. No trustworthy signal — leave strategy=None
+    # (Never silently collapse unknown distributed runs to ddp)
+
+    if strategy and dp is None and num_gpus_detected > 1:
+        dp = num_gpus_detected
 
     return {
         "num_nodes": nnodes or 1,
@@ -3592,6 +3654,7 @@ def _infer_parallel_topology_from_env(*, num_gpus_detected: int, config_intercon
         "dp_degree": dp,
         "interconnect_type": interconnect,
         "strategy": strategy,
+        "strategy_detection_method": strategy_detection_method,
     }
 
 

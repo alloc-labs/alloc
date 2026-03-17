@@ -132,6 +132,34 @@ def analyze_script(script_path: str) -> CodeFindings:
     return findings
 
 
+def detect_strategy_hint(script_path: str) -> Optional[str]:
+    """Lightweight AST check: return strategy kind if detectable, else None.
+
+    Returns one of: 'fsdp', 'ddp', 'deepspeed', 'data_parallel', or None.
+    Never crashes — returns None on any error.
+    """
+    try:
+        if not os.path.isfile(script_path):
+            return None
+        with open(script_path, "r") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=script_path)
+        imports = _walk_imports(tree)
+        distributed = _find_distributed(tree, imports, source.splitlines(), script_path)
+        # Priority: fsdp > deepspeed > ddp
+        # data_parallel is single-process (not a distributed strategy) — ignored.
+        kinds = {d.kind for d in distributed}
+        if "fsdp" in kinds:
+            return "fsdp"
+        if "deepspeed" in kinds:
+            return "deepspeed"
+        if "ddp" in kinds:
+            return "ddp"
+        return None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Import resolution
 # ---------------------------------------------------------------------------

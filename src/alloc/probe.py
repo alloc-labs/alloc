@@ -374,12 +374,27 @@ def probe_command(
     """
     pynvml = _try_import_pynvml()
 
-    # Launch the user's training subprocess — do NOT modify env (their warnings matter)
+    # Launch the user's training subprocess.
+    # Suppress only pynvml/torch.cuda FutureWarning noise — these come from
+    # Alloc's own callbacks or from torch internals, not from user code.
+    # Propagates to torchrun children and most Ray workers via env inheritance.
+    child_env = os.environ.copy()
+    existing_pw = child_env.get("PYTHONWARNINGS", "")
+    alloc_filters = (
+        "ignore::FutureWarning:pynvml,"
+        "ignore::DeprecationWarning:pynvml,"
+        "ignore::FutureWarning:torch.cuda,"
+        "ignore::DeprecationWarning:torch.cuda"
+    )
+    child_env["PYTHONWARNINGS"] = (
+        f"{existing_pw},{alloc_filters}" if existing_pw else alloc_filters
+    )
     try:
         proc = subprocess.Popen(
             command,
             stdout=sys.stdout,
             stderr=sys.stderr,
+            env=child_env,
         )
     except Exception as e:
         return ProbeResult(
@@ -518,11 +533,11 @@ def probe_command(
                         power_vals.append(pw)
                         total_mb = mi.total / (1024 * 1024)
 
-                    # Track per-GPU peak VRAM for multi-GPU runs
-                    if len(handles) > 1:
-                        pgp = per_gpu_peaks_ref[0]
-                        for gi, vm in enumerate(vram_vals):
-                            pgp[gi] = max(pgp.get(gi, 0.0), vm)
+                    # Track per-GPU peak VRAM (always, even single GPU —
+                    # discovery may expand handles later, and we need history from sample 0)
+                    pgp = per_gpu_peaks_ref[0]
+                    for gi, vm in enumerate(vram_vals):
+                        pgp[gi] = max(pgp.get(gi, 0.0), vm)
 
                     samples.append(ProbeSample(
                         timestamp=time.time(),
@@ -675,7 +690,7 @@ def probe_command(
         process_map=process_map_ref[0],
         per_gpu_peak_vram_mb=(
             [round(per_gpu_peaks_ref[0].get(i, 0), 1) for i in range(num_gpus_ref[0])]
-            if len(per_gpu_peaks_ref[0]) > 1 else None
+            if num_gpus_ref[0] > 1 and per_gpu_peaks_ref[0] else None
         ),
         detected_interconnect=detected_ic_ref[0],
     )
