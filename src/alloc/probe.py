@@ -510,6 +510,16 @@ def probe_command(
                                 pmap.append({"gpu_index": idx})
                             num_gpus_ref[0] = len(handles)
                             process_map_ref[0] = pmap
+                            # Immediately sample all discovered GPUs so per_gpu_peaks
+                            # is populated even if the process exits right after discovery
+                            pgp = per_gpu_peaks_ref[0]
+                            for gi, h in enumerate(handles):
+                                try:
+                                    mi = pynvml.nvmlDeviceGetMemoryInfo(h)
+                                    vm = mi.used / (1024 * 1024)
+                                    pgp[gi] = max(pgp.get(gi, 0.0), vm)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     # Detect interconnect type between discovered GPUs
