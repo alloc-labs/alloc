@@ -152,6 +152,28 @@ def _detect_architecture(model, optimizer=None, training_args=None):
                 if hasattr(config, "num_attention_heads") or hasattr(config, "num_heads"):
                     info["architecture_type"] = "transformer"
 
+            # --- Architecture dimensions ---
+            num_heads = (
+                getattr(config, "num_attention_heads", None)
+                or getattr(config, "num_heads", None)
+                or getattr(config, "n_head", None)
+            )
+            if num_heads is not None:
+                info["num_heads"] = num_heads
+            vocab_size = getattr(config, "vocab_size", None)
+            if vocab_size is not None:
+                info["vocab_size"] = vocab_size
+            hidden_dim = getattr(config, "hidden_size", None)
+            if hidden_dim is not None:
+                info["hidden_dim"] = hidden_dim
+            num_layers = (
+                getattr(config, "num_hidden_layers", None)
+                or getattr(config, "num_layers", None)
+                or getattr(config, "n_layer", None)
+            )
+            if num_layers is not None:
+                info["num_layers"] = num_layers
+
         # --- Gradient checkpointing ---
         gc = getattr(model, "is_gradient_checkpointing", None)
         if gc is not None:
@@ -305,7 +327,8 @@ def _build_sidecar(
     if architecture_info:
         for key in ("architecture_type", "optimizer_type", "fine_tuning_method",
                      "gradient_checkpointing", "model_type", "attention_type",
-                     "param_count", "trainable_param_count"):
+                     "param_count", "trainable_param_count",
+                     "num_heads", "vocab_size", "hidden_dim", "num_layers"):
             val = architecture_info.get(key)
             if val is not None:
                 data[key] = val
@@ -681,6 +704,8 @@ def _write_full_artifact(monitor, sidecar_data, step_times_raw=None):
             "architecture_type", "optimizer_type", "fine_tuning_method",
             "gradient_checkpointing", "model_type", "attention_type",
             "param_count", "trainable_param_count",
+            # Architecture dimensions (extracted from model config)
+            "num_heads", "vocab_size", "hidden_dim", "num_layers",
             # Distributed signals (P3.5-C)
             "comm_overhead_pct",
         ]

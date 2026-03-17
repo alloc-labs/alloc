@@ -176,3 +176,75 @@ def test_count_params_dedup_shared():
     count, dtype_str = _count_params(model)
     # embed.weight = 100*64 = 6400 params (shared with proj.weight)
     assert count == 6400
+
+
+# ---------------------------------------------------------------------------
+# _extract_architecture — vocab_size, num_heads
+# ---------------------------------------------------------------------------
+
+
+def test_extract_architecture_includes_vocab_size_and_num_heads():
+    """Result dict should include vocab_size and num_heads when config has them."""
+    from alloc.extractor_runner import _extract_architecture
+
+    class FakeConfig:
+        hidden_size = 4096
+        num_hidden_layers = 32
+        max_position_embeddings = 2048
+        model_type = "llama"
+        vocab_size = 32000
+        num_attention_heads = 32
+
+    class FakeModel:
+        config = FakeConfig()
+
+    info = _extract_architecture(FakeModel())
+    assert info["vocab_size"] == 32000
+    assert info["num_heads"] == 32
+    assert info["hidden_dim"] == 4096
+    assert info["num_layers"] == 32
+    assert info["model_type"] == "llama"
+
+
+def test_extract_architecture_num_heads_fallback_attrs():
+    """num_heads extraction falls back to num_heads and n_head attrs."""
+    from alloc.extractor_runner import _extract_architecture
+
+    # Test num_heads attr
+    class ConfigWithNumHeads:
+        hidden_size = 768
+        num_hidden_layers = 12
+        num_heads = 12
+        model_type = "custom"
+        vocab_size = 50000
+
+    class FakeModel1:
+        config = ConfigWithNumHeads()
+
+    info = _extract_architecture(FakeModel1())
+    assert info["num_heads"] == 12
+
+    # Test n_head attr
+    class ConfigWithNHead:
+        hidden_size = 768
+        n_layer = 12
+        n_head = 12
+        model_type = "gpt2"
+        vocab_size = 50257
+
+    class FakeModel2:
+        config = ConfigWithNHead()
+
+    info2 = _extract_architecture(FakeModel2())
+    assert info2["num_heads"] == 12
+
+
+def test_extract_architecture_no_config():
+    """Model without config returns empty dict."""
+    from alloc.extractor_runner import _extract_architecture
+
+    class BareModel:
+        pass
+
+    info = _extract_architecture(BareModel())
+    assert info == {}

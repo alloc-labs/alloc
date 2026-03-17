@@ -223,3 +223,84 @@ def test_upload_enriches_payload_from_probe_and_hardware(tmp_path):
     assert payload["step_time_ms_p90"] == 161.8
     assert payload["samples_per_sec"] == 22.9
     assert payload["dataloader_wait_pct"] == 11.3
+
+
+def test_upload_sends_architecture_dimensions(tmp_path):
+    """Upload should send vocab_size, num_heads, model_type from probe and ghost."""
+    import gzip
+
+    artifact = tmp_path / "arch_dims.json.gz"
+    data = {
+        "probe": {
+            "peak_vram_mb": 5000,
+            "vocab_size": 32000,
+            "num_heads": 32,
+            "model_type": "llama",
+            "hidden_dim": 4096,
+            "num_layers": 32,
+        },
+        "hardware": {"gpu_name": "NVIDIA A100-SXM4-80GB"},
+        "ghost": {
+            "seq_length": 2048,
+        },
+    }
+    with gzip.open(str(artifact), "wt", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"run_id": "run-dims", "status": "completed"}
+
+    mock_client = MagicMock()
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client.post.return_value = mock_response
+
+    with patch("httpx.Client", return_value=mock_client):
+        upload_artifact(str(artifact), "http://localhost:8000", "test-token")
+
+    payload = mock_client.post.call_args.kwargs["json"]
+    assert payload["vocab_size"] == 32000
+    assert payload["num_heads"] == 32
+    assert payload["model_type"] == "llama"
+    assert payload["hidden_dim"] == 4096
+    assert payload["num_layers"] == 32
+    assert payload["seq_length"] == 2048
+
+
+def test_upload_ghost_fallback_for_dimensions(tmp_path):
+    """Ghost fields should be used as fallback when probe doesn't have dimensions."""
+    import gzip
+
+    artifact = tmp_path / "ghost_fallback.json.gz"
+    data = {
+        "probe": {"peak_vram_mb": 5000},
+        "hardware": {"gpu_name": "NVIDIA A100-SXM4-80GB"},
+        "ghost": {
+            "vocab_size": 50257,
+            "num_heads": 12,
+            "model_type": "gpt2",
+            "hidden_dim": 768,
+            "num_layers": 12,
+            "seq_length": 1024,
+        },
+    }
+    with gzip.open(str(artifact), "wt", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"run_id": "run-ghost", "status": "completed"}
+
+    mock_client = MagicMock()
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client.post.return_value = mock_response
+
+    with patch("httpx.Client", return_value=mock_client):
+        upload_artifact(str(artifact), "http://localhost:8000", "test-token")
+
+    payload = mock_client.post.call_args.kwargs["json"]
+    assert payload["vocab_size"] == 50257
+    assert payload["num_heads"] == 12
+    assert payload["model_type"] == "gpt2"

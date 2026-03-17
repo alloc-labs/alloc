@@ -870,6 +870,33 @@ class TestWriteFullArtifactWithPhases:
             assert call_kwargs.kwargs.get("output_path") is None  # default = alloc_artifact.json.gz
 
 
+    def test_dimension_fields_in_full_artifact(self, tmp_path):
+        """Architecture dimension fields from sidecar must flow to full artifact."""
+        monitor = _NvmlMonitor()
+        sidecar = {
+            "framework": "test",
+            "step_count": 10,
+            "step_time_ms_p50": 100.0,
+            "num_heads": 32,
+            "vocab_size": 32000,
+            "hidden_dim": 4096,
+            "num_layers": 32,
+            "model_type": "llama",
+            "architecture_type": "transformer",
+        }
+
+        with patch("alloc.artifact_writer.write_report") as mock_write:
+            _write_full_artifact(monitor, sidecar)
+            assert mock_write.called
+            probe = mock_write.call_args.kwargs.get("probe_result")
+            assert probe["num_heads"] == 32
+            assert probe["vocab_size"] == 32000
+            assert probe["hidden_dim"] == 4096
+            assert probe["num_layers"] == 32
+            assert probe["model_type"] == "llama"
+            assert probe["architecture_type"] == "transformer"
+
+
 # ── Architecture Detection (P3-A) ──────────────────────────────────────
 
 class TestDetectArchitecture:
@@ -1040,6 +1067,97 @@ class TestBuildSidecarArchitecture:
         assert data["optimizer_type"] == "SGD"
         assert "gradient_checkpointing" not in data
         assert "architecture_type" not in data
+
+    def test_dimension_fields_included(self):
+        """New dimension fields (num_heads, vocab_size, hidden_dim, num_layers) flow through sidecar."""
+        arch_info = {
+            "architecture_type": "transformer",
+            "num_heads": 32,
+            "vocab_size": 32000,
+            "hidden_dim": 4096,
+            "num_layers": 32,
+            "model_type": "llama",
+        }
+        data = _build_sidecar(
+            framework="huggingface",
+            step_count=10,
+            step_times_ms=[100.0],
+            batch_size=8,
+            architecture_info=arch_info,
+        )
+        assert data["num_heads"] == 32
+        assert data["vocab_size"] == 32000
+        assert data["hidden_dim"] == 4096
+        assert data["num_layers"] == 32
+        assert data["model_type"] == "llama"
+
+
+class TestDetectArchitectureDimensions:
+    """Test that _detect_architecture extracts dimension values from config."""
+
+    def test_extracts_all_dimensions(self):
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "llama"
+        model.config.num_attention_heads = 32
+        model.config.vocab_size = 32000
+        model.config.hidden_size = 4096
+        model.config.num_hidden_layers = 32
+        model.is_gradient_checkpointing = False
+        del model.peft_config
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+        del model.config.num_heads
+        del model.config.n_head
+        del model.config.num_layers
+        del model.config.n_layer
+
+        result = _detect_architecture(model)
+        assert result["num_heads"] == 32
+        assert result["vocab_size"] == 32000
+        assert result["hidden_dim"] == 4096
+        assert result["num_layers"] == 32
+
+    def test_fallback_attr_names(self):
+        """Falls back to alternate attribute names (n_head, n_layer)."""
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        model.config.model_type = "gpt2"
+        model.config.n_head = 12
+        model.config.vocab_size = 50257
+        model.config.hidden_size = 768
+        model.config.n_layer = 12
+        model.is_gradient_checkpointing = False
+        del model.peft_config
+        del model.config._attn_implementation
+        del model.config.attn_implementation
+        del model.config.num_attention_heads
+        del model.config.num_heads
+        del model.config.num_hidden_layers
+        del model.config.num_layers
+
+        result = _detect_architecture(model)
+        assert result["num_heads"] == 12
+        assert result["vocab_size"] == 50257
+        assert result["hidden_dim"] == 768
+        assert result["num_layers"] == 12
+
+    def test_no_config_no_dimensions(self):
+        """Model without config should not have dimension fields."""
+        from alloc.callbacks import _detect_architecture
+
+        model = MagicMock()
+        del model.config
+        del model.peft_config
+        del model.is_gradient_checkpointing
+
+        result = _detect_architecture(model)
+        assert "num_heads" not in result
+        assert "vocab_size" not in result
+        assert "hidden_dim" not in result
+        assert "num_layers" not in result
 
 
 # ── CUDA Event Non-Blocking Sync (C2 Fix) ─────────────────────────────

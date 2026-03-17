@@ -71,6 +71,11 @@ def _extract_architecture(model):
             or getattr(config, "n_positions", None)
             or getattr(config, "max_seq_len", None)
         )
+        info["num_heads"] = (
+            getattr(config, "num_attention_heads", None)
+            or getattr(config, "num_heads", None)
+            or getattr(config, "n_head", None)
+        )
         info["model_type"] = getattr(config, "model_type", None)
         info["vocab_size"] = getattr(config, "vocab_size", None)
         info["image_size"] = getattr(config, "image_size", None)
@@ -277,6 +282,8 @@ def main():
             "num_layers": arch_info.get("num_layers"),
             "seq_length": arch_info.get("seq_length"),
             "model_type": arch_info.get("model_type"),
+            "vocab_size": arch_info.get("vocab_size"),
+            "num_heads": arch_info.get("num_heads"),
             "activation_memory_bytes": activation_result.get("activation_memory_bytes"),
             "activation_method": activation_result.get("activation_method"),
         }

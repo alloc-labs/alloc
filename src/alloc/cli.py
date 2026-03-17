@@ -493,10 +493,20 @@ def run(
             "baseline_run_id": after,
             "experiment_id": experiment,
         }
-        # Merge timing fields from callback sidecar
+        # Merge timing + architecture fields from callback sidecar
         if callback_data:
             for key in ("step_time_ms_p50", "step_time_ms_p90", "samples_per_sec",
-                         "step_time_ms_mean", "step_time_ms_std"):
+                         "step_time_ms_mean", "step_time_ms_std",
+                         "architecture_type", "optimizer_type", "fine_tuning_method",
+                         "gradient_checkpointing", "model_type", "attention_type",
+                         "param_count", "trainable_param_count",
+                         "num_heads", "vocab_size", "hidden_dim", "num_layers",
+                         "phase_forward_ms_p50", "phase_forward_ms_p90",
+                         "phase_backward_ms_p50", "phase_backward_ms_p90",
+                         "phase_optimizer_ms_p50", "phase_optimizer_ms_p90",
+                         "phase_dataloader_ms_p50", "phase_dataloader_ms_p90",
+                         "has_phase_timing", "comm_overhead_pct",
+                         "dataloader_wait_pct", "batch_size"):
                 val = callback_data.get(key)
                 if val is not None:
                     probe_dict[key] = val
