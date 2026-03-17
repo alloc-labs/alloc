@@ -564,8 +564,11 @@ def run(
             else:
                 console.print("[dim]Tip: alloc login --browser to connect your dashboard[/dim]")
 
+    # Propagate non-zero exit code — but NOT when calibrate mode
+    # intentionally killed the process (torchrun exits non-zero on SIGTERM)
     if result.exit_code and result.exit_code != 0:
-        raise typer.Exit(result.exit_code)
+        if result.stop_reason not in ("stable", "timeout"):
+            raise typer.Exit(result.exit_code)
 
 
 @app.command()
@@ -2114,6 +2117,13 @@ def scan(
 ):
     """Remote ghost scan via Alloc API — no GPU needed."""
     import httpx
+
+    # When --json, redirect console to stderr so nothing contaminates stdout.
+    from rich.console import Console as _Console
+    if json_output:
+        console = _Console(stderr=True)
+    else:
+        console = _Console()
 
     # Resolve param count from model name or explicit flag
     resolved_param_count = param_count_b or _model_to_params(model)
