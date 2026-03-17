@@ -700,7 +700,7 @@ def probe_command(
         process_map=process_map_ref[0],
         per_gpu_peak_vram_mb=(
             [round(per_gpu_peaks_ref[0].get(i, 0), 1) for i in range(num_gpus_ref[0])]
-            if num_gpus_ref[0] > 1 and per_gpu_peaks_ref[0] else None
+            if num_gpus_ref[0] >= 1 and per_gpu_peaks_ref[0] else None
         ),
         detected_interconnect=detected_ic_ref[0],
     )
