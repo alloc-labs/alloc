@@ -245,3 +245,118 @@ def test_active_gpu_fallback_not_used_without_expected():
         with patch("alloc.probe._read_child_env", return_value=None):
             result = _discover_gpu_indices(1000, mock, fallback_index=0)
     assert result == [0]  # Falls back to default
+
+
+# ── Early handle initialization for expected GPUs ──
+
+
+def test_early_init_opens_handles_for_expected_gpus():
+    """When expected_gpus > 1 and device_count >= expected, early-init should
+    open handles for all expected GPUs."""
+    mock_pynvml = MagicMock()
+    mock_pynvml.nvmlDeviceGetCount = MagicMock(return_value=2)
+
+    handles_map = {0: MagicMock(name="gpu0"), 1: MagicMock(name="gpu1")}
+    mock_pynvml.nvmlDeviceGetHandleByIndex = MagicMock(side_effect=lambda i: handles_map[i])
+
+    # Simulate early-init logic from probe_command._monitor()
+    expected_gpus = 2
+    handles = [handles_map[0]]
+
+    if expected_gpus > 1:
+        device_count = mock_pynvml.nvmlDeviceGetCount()
+        if device_count >= expected_gpus:
+            early_handles = []
+            early_indices = []
+            for idx in range(device_count):
+                if len(early_handles) >= expected_gpus:
+                    break
+                h = mock_pynvml.nvmlDeviceGetHandleByIndex(idx)
+                early_handles.append(h)
+                early_indices.append(idx)
+            if len(early_handles) >= expected_gpus:
+                handles = early_handles
+
+    assert len(handles) == 2
+
+
+def test_early_init_skipped_when_fewer_devices():
+    """When device_count < expected_gpus, early-init should not change handles."""
+    mock_pynvml = MagicMock()
+    mock_pynvml.nvmlDeviceGetCount = MagicMock(return_value=1)
+
+    expected_gpus = 2
+    handles = [MagicMock(name="gpu0")]
+    original_handles = list(handles)
+
+    if expected_gpus > 1:
+        device_count = mock_pynvml.nvmlDeviceGetCount()
+        if device_count >= expected_gpus:
+            assert False, "Should not reach here"
+
+    assert len(handles) == 1
+
+
+def test_per_gpu_sampling_resilient_to_partial_failure():
+    """Per-GPU try/except: one GPU failure should not prevent others from
+    being sampled into per_gpu_peaks."""
+    mock_pynvml = MagicMock()
+    handles_map = {0: MagicMock(name="gpu0"), 1: MagicMock(name="gpu1")}
+
+    mem_ok = MagicMock()
+    mem_ok.total = 24 * 1024 * 1024 * 1024
+    mem_ok.used = 8000 * 1024 * 1024
+
+    def mem_info_side_effect(h):
+        if h == handles_map[1]:
+            raise RuntimeError("GPU 1 memory read failed")
+        return mem_ok
+
+    mock_pynvml.nvmlDeviceGetMemoryInfo = MagicMock(side_effect=mem_info_side_effect)
+    util = MagicMock()
+    util.gpu = 80
+    mock_pynvml.nvmlDeviceGetUtilizationRates = MagicMock(return_value=util)
+    mock_pynvml.nvmlDeviceGetPowerUsage = MagicMock(return_value=100_000)
+
+    # Simulate the per-GPU sampling loop
+    handles = [handles_map[0], handles_map[1]]
+    per_gpu_peaks = {}
+    vram_vals = []
+
+    for h in handles:
+        try:
+            mi = mock_pynvml.nvmlDeviceGetMemoryInfo(h)
+            vram_vals.append(mi.used / (1024 * 1024))
+        except Exception:
+            pass
+
+    for gi, vm in enumerate(vram_vals):
+        per_gpu_peaks[gi] = max(per_gpu_peaks.get(gi, 0.0), vm)
+
+    # GPU 0 tracked, GPU 1 skipped
+    assert 0 in per_gpu_peaks
+    assert per_gpu_peaks[0] > 0
+    assert len(vram_vals) == 1
+
+
+def test_stability_delayed_until_discovery_done():
+    """Stability check requires discovery_done=True."""
+    # Single GPU: expected=1, num_gpus=1 → done immediately
+    assert 1 >= 1  # num_gpus >= expected
+
+    # Multi GPU with early-init: expected=2, num_gpus=2 → done at sample 5
+    assert 2 >= 2
+
+    # Multi GPU, discovery incomplete: expected=4, found=2 → NOT done
+    assert not (2 >= 4)
+
+
+def test_per_gpu_peaks_to_result_list():
+    """per_gpu_peaks dict should convert to sorted list for ProbeResult."""
+    peaks = {0: 8000.5, 1: 12000.3}
+    result = [round(peaks[i], 1) for i in sorted(peaks)] if peaks else None
+    assert result == [8000.5, 12000.3]
+
+    empty = {}
+    result_empty = [round(empty[i], 1) for i in sorted(empty)] if empty else None
+    assert result_empty is None

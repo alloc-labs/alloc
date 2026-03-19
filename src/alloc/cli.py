@@ -2184,11 +2184,13 @@ def scan(
                     resp = client.post(f"{api_url}/scans", json=payload, headers=headers)
                 else:
                     # Token refresh failed — fall back to unauthenticated scan
-                    if not json_output:
-                        console.print(
-                            "[yellow]Session expired — falling back to public scan "
-                            "(org fleet context unavailable). Run `alloc login` to restore.[/yellow]",
-                        )
+                    # Always print to stderr (not stdout) so JSON output is clean
+                    import sys as _sys
+                    print(
+                        "Session expired — falling back to public scan "
+                        "(org fleet context unavailable). Run `alloc login` to restore.",
+                        file=_sys.stderr,
+                    )
                     del headers["Authorization"]
                     resp = client.post(f"{api_url}/scans/cli", json=payload, headers=headers)
 

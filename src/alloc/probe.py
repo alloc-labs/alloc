@@ -469,6 +469,8 @@ def probe_command(
                 pass
 
             handles = [handle]
+            # Map from handle index → physical GPU index (for per_gpu_peaks keying)
+            handle_gpu_indices = [gpu_index]
             discovery_done = False
             discovery_attempts = 0
             max_discovery_attempts = 3  # Retry at samples 5, 15, 30
@@ -487,6 +489,32 @@ def probe_command(
                 except ValueError:
                     pass
 
+            # Early-initialize handles for all expected GPUs so per_gpu_peaks
+            # is populated from sample 0 — don't depend on process-tree
+            # discovery timing. Discovery still runs for process_map and to
+            # confirm which specific GPUs are in use.
+            if expected_gpus > 1:
+                try:
+                    device_count = pynvml.nvmlDeviceGetCount()
+                    if device_count >= expected_gpus:
+                        early_handles = []
+                        early_indices = []
+                        for idx in range(device_count):
+                            if len(early_handles) >= expected_gpus:
+                                break
+                            try:
+                                h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                                early_handles.append(h)
+                                early_indices.append(idx)
+                            except Exception:
+                                pass
+                        if len(early_handles) >= expected_gpus:
+                            handles = early_handles
+                            handle_gpu_indices = early_indices
+                            num_gpus_ref[0] = len(handles)
+                except Exception:
+                    pass
+
             while not stop_event.is_set():
                 # Retry GPU discovery: at samples 5, 15, 30
                 # Keep retrying if we haven't found all expected GPUs yet
@@ -503,10 +531,12 @@ def probe_command(
                         )
                         if len(discovered) > 1:
                             handles = []
+                            handle_gpu_indices = []
                             pmap = []
                             for idx in discovered:
                                 h = pynvml.nvmlDeviceGetHandleByIndex(idx)
                                 handles.append(h)
+                                handle_gpu_indices.append(idx)
                                 pmap.append({"gpu_index": idx})
                             num_gpus_ref[0] = len(handles)
                             process_map_ref[0] = pmap
@@ -529,12 +559,13 @@ def probe_command(
                         discovery_done = True
 
                 # Sample from all monitored GPUs — aggregate: peak vram = max, util/power = mean
-                try:
-                    vram_vals = []
-                    util_vals = []
-                    power_vals = []
-                    total_mb = 0.0
-                    for h in handles:
+                # Per-GPU try/except: one bad handle must not prevent tracking others
+                vram_vals = []
+                util_vals = []
+                power_vals = []
+                total_mb = 0.0
+                for h in handles:
+                    try:
                         mi = pynvml.nvmlDeviceGetMemoryInfo(h)
                         ut = pynvml.nvmlDeviceGetUtilizationRates(h)
                         pw = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
@@ -542,25 +573,28 @@ def probe_command(
                         util_vals.append(ut.gpu)
                         power_vals.append(pw)
                         total_mb = mi.total / (1024 * 1024)
+                    except Exception:
+                        pass
 
-                    # Track per-GPU peak VRAM (always, even single GPU —
-                    # discovery may expand handles later, and we need history from sample 0)
-                    pgp = per_gpu_peaks_ref[0]
-                    for gi, vm in enumerate(vram_vals):
-                        pgp[gi] = max(pgp.get(gi, 0.0), vm)
+                # Track per-GPU peak VRAM (always, even single GPU —
+                # discovery may expand handles later, and we need history from sample 0)
+                pgp = per_gpu_peaks_ref[0]
+                for gi, vm in enumerate(vram_vals):
+                    pgp[gi] = max(pgp.get(gi, 0.0), vm)
 
+                if vram_vals:
                     samples.append(ProbeSample(
                         timestamp=time.time(),
                         memory_used_mb=max(vram_vals),
                         memory_total_mb=total_mb,
-                        gpu_util_pct=sum(util_vals) / len(util_vals),
-                        power_watts=sum(power_vals) / len(power_vals),
+                        gpu_util_pct=sum(util_vals) / len(util_vals) if util_vals else 0.0,
+                        power_watts=sum(power_vals) / len(power_vals) if power_vals else 0.0,
                     ))
-                except Exception:
-                    pass
 
                 # Calibrate mode: auto-stop when stable
-                if calibrate and len(samples) > ramp_up_samples:
+                # Delay stability check until GPU discovery is complete —
+                # prevents calibrate-and-exit before finding all expected GPUs.
+                if calibrate and discovery_done and len(samples) > ramp_up_samples:
                     from alloc.stability import check_stability, RAMP_UP_SAMPLES
                     sr = check_stability(samples, poll_interval_ms=poll_interval_ms)
                     if sr.is_stable:
