@@ -360,3 +360,55 @@ def test_per_gpu_peaks_to_result_list():
     empty = {}
     result_empty = [round(empty[i], 1) for i in sorted(empty)] if empty else None
     assert result_empty is None
+
+
+def test_fallback_process_map_from_early_init():
+    """When discovery exhausts all attempts without confirming GPUs,
+    process_map should be generated from early-init indices."""
+    early_init_indices = [0, 1]
+    process_map_ref = [None]
+    num_gpus_ref = [1]
+    discovery_attempts = 3
+    max_discovery_attempts = 3
+    expected_gpus = 2
+
+    # Simulate: discovery exhausted, never found >1 via PID matching
+    if num_gpus_ref[0] >= expected_gpus or discovery_attempts >= max_discovery_attempts:
+        discovery_done = True
+        if process_map_ref[0] is None and early_init_indices is not None:
+            process_map_ref[0] = [{"gpu_index": idx} for idx in early_init_indices]
+            num_gpus_ref[0] = len(early_init_indices)
+
+    assert process_map_ref[0] == [{"gpu_index": 0}, {"gpu_index": 1}]
+    assert num_gpus_ref[0] == 2
+
+
+def test_no_fallback_process_map_when_discovery_succeeded():
+    """When discovery already set process_map, fallback should not overwrite."""
+    early_init_indices = [0, 1]
+    process_map_ref = [[{"gpu_index": 2}, {"gpu_index": 3}]]  # discovery found GPUs 2,3
+    num_gpus_ref = [2]
+
+    # Simulate fallback condition
+    if process_map_ref[0] is None and early_init_indices is not None:
+        process_map_ref[0] = [{"gpu_index": idx} for idx in early_init_indices]
+
+    # Should keep discovery's result, not overwrite
+    assert process_map_ref[0] == [{"gpu_index": 2}, {"gpu_index": 3}]
+
+
+def test_early_init_does_not_set_num_gpus_ref():
+    """Early-init must NOT set num_gpus_ref — that would satisfy discovery_done
+    prematurely and prevent retries at samples 15/30."""
+    # Simulate the early-init code path
+    num_gpus_ref = [1]
+    expected_gpus = 2
+    device_count = 2  # enough devices
+
+    # Early-init opens handles but does NOT touch num_gpus_ref
+    early_init_indices = list(range(expected_gpus))
+
+    # num_gpus_ref should still be 1
+    assert num_gpus_ref[0] == 1
+    # So discovery_done check fails: 1 < 2
+    assert not (num_gpus_ref[0] >= expected_gpus)

@@ -492,7 +492,10 @@ def probe_command(
             # Early-initialize handles for all expected GPUs so per_gpu_peaks
             # is populated from sample 0 — don't depend on process-tree
             # discovery timing. Discovery still runs for process_map and to
-            # confirm which specific GPUs are in use.
+            # confirm which specific GPUs are in use via PID matching.
+            # NOTE: Do NOT set num_gpus_ref here — that would satisfy
+            # discovery_done prematurely and prevent retries at samples 15/30.
+            early_init_indices = None  # type: Optional[list]
             if expected_gpus > 1:
                 try:
                     device_count = pynvml.nvmlDeviceGetCount()
@@ -511,7 +514,7 @@ def probe_command(
                         if len(early_handles) >= expected_gpus:
                             handles = early_handles
                             handle_gpu_indices = early_indices
-                            num_gpus_ref[0] = len(handles)
+                            early_init_indices = early_indices
                 except Exception:
                     pass
 
@@ -557,6 +560,12 @@ def probe_command(
                     # Stop retrying if we found expected count or exhausted attempts
                     if num_gpus_ref[0] >= expected_gpus or discovery_attempts >= max_discovery_attempts:
                         discovery_done = True
+                        # If discovery never confirmed multi-GPU via PID matching
+                        # but early-init opened handles for expected GPUs, generate
+                        # a fallback process_map from the early-init indices.
+                        if process_map_ref[0] is None and early_init_indices is not None:
+                            process_map_ref[0] = [{"gpu_index": idx} for idx in early_init_indices]
+                            num_gpus_ref[0] = len(early_init_indices)
 
                 # Sample from all monitored GPUs — aggregate: peak vram = max, util/power = mean
                 # Per-GPU try/except: one bad handle must not prevent tracking others
